@@ -1,0 +1,6 @@
+id = "count-lines"
+prompt = "How many lines are in notes.txt? Answer with just the number."
+[files]
+"notes.txt" = "buy milk\ncall mum\nfix bike\nbook dentist\nrenew passport\n"
+[check]
+reply_contains = ["5"]

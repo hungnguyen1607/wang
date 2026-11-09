@@ -1,0 +1,8 @@
+id = "biggest-file"
+prompt = "Which file in this folder is the largest? Just give the file name."
+[files]
+"a.txt" = "small"
+"report.csv" = "0123456789012345678901234567890123456789012345678901234567890123456789"
+"b.md" = "medium sized file here"
+[check]
+reply_contains = ["report.csv"]

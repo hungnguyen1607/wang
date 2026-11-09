@@ -1,0 +1,7 @@
+id = "count-todos"
+prompt = "How many TODO items are there across the markdown files here?"
+[files]
+"plan.md" = "# Plan\n- TODO: email landlord\n- done: pay rent\n- TODO: fix sink\n"
+"work/ideas.md" = "TODO: write blog post\nnot a todo\n"
+[check]
+reply_contains = ["3"]

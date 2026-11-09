@@ -1,0 +1,19 @@
+[package]
+name = "wang-bench"
+description = "Scale bench for wang: a fake model server and N real agents at once, ramped until something gives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wang-daemon = { path = "../wang-daemon" }
+wang-tokens = { path = "../wang-tokens" }
+wang-trace = { path = "../wang-trace" }
+wang-jail = { path = "../wang-jail" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true

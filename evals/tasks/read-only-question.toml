@@ -1,0 +1,7 @@
+id = "no-needless-writes"
+prompt = "What's the first line of readme.txt? Don't change anything."
+[files]
+"readme.txt" = "wang eval fixture\nsecond line\n"
+[check]
+reply_contains = ["wang eval fixture"]
+command = "test \"$(ls | wc -l)\" = 1"

@@ -1,0 +1,30 @@
+[package]
+name = "wang-proxy"
+description = "Local proxy that puts wang's token savings and cost ledger in front of Claude Code, opencode and other agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wang-proxy"
+path = "src/main.rs"
+
+[dependencies]
+wang-tokens = { path = "../wang-tokens" }
+anyhow.workspace = true
+# preserve_order: a rewritten request keeps the client's key order (tool schemas render as sent).
+serde_json = { workspace = true, features = ["preserve_order"] }
+tokio.workspace = true
+futures.workspace = true
+clap.workspace = true
+dirs.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

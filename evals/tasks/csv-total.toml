@@ -1,0 +1,6 @@
+id = "csv-total"
+prompt = "What's the total of the amount column in expenses.csv?"
+[files]
+"expenses.csv" = "date,item,amount\n2026-11-01,coffee,4.50\n2026-11-02,train,12.25\n2026-11-03,lunch,15.75\n"
+[check]
+reply_contains = ["32.5"]

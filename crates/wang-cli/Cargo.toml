@@ -1,0 +1,28 @@
+[package]
+name = "wang-cli"
+description = "wang: secure, lightweight, token-cheap laptop agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wang"
+path = "src/main.rs"
+
+[dependencies]
+wang-daemon = { path = "../wang-daemon" }
+wang-tokens = { path = "../wang-tokens" }
+wang-trace = { path = "../wang-trace" }
+wang-jail = { path = "../wang-jail" }
+wang-evals = { path = "../wang-evals" }
+wang-bench = { path = "../wang-bench" }
+wang-proxy = { path = "../wang-proxy" }
+wang-browser = { path = "../wang-browser" }
+wang-vm = { path = "../wang-vm" }
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+dirs.workspace = true

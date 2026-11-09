@@ -1,0 +1,17 @@
+[package]
+name = "wang-browser"
+description = "Headless Chrome for wang's agent: own CDP client over a pipe, compact page view, a pool of jailed browsers with RAM caps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wang-jail = { path = "../wang-jail" }
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+dirs.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

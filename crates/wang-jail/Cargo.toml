@@ -1,0 +1,24 @@
+[package]
+name = "wang-jail"
+description = "Sandbox for agent tools: namespaces (bubblewrap), cgroups v2, seccomp, domain allow-list egress proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jail"
+path = "src/bin/jail.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+dirs.workspace = true
+clap.workspace = true
+libc = "0.2"
+seccompiler = "0.5"
+
+[dev-dependencies]
+futures.workspace = true

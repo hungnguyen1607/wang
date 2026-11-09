@@ -1,0 +1,10 @@
+[package]
+name = "wang-vm-agent"
+description = "PID 1 inside wang micro-VMs: RAM overlay root, command server over vsock, proxy forwarder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+serde_json.workspace = true

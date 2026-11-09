@@ -1,0 +1,6 @@
+id = "json-field"
+prompt = "What port is the server configured to use in config.json?"
+[files]
+"config.json" = '{"server": {"host": "0.0.0.0", "port": 8443}, "debug": false}'
+[check]
+reply_contains = ["8443"]

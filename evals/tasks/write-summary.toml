@@ -1,0 +1,9 @@
+id = "write-summary"
+prompt = "Create summary.txt containing only the number of .md files in this folder (including subfolders)."
+[files]
+"a.md" = "x"
+"b.md" = "y"
+"docs/c.md" = "z"
+"notes.txt" = "not markdown"
+[check]
+command = "test \"$(tr -d '[:space:]' < summary.txt)\" = 3"

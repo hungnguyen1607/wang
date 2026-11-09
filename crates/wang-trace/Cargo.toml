@@ -1,0 +1,11 @@
+[package]
+name = "wang-trace"
+description = "Agent observability for wang: spans for tasks, steps, model calls and tool calls in SQLite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true

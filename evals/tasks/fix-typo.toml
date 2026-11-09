@@ -1,0 +1,6 @@
+id = "fix-typo"
+prompt = "Fix the typo 'teh' -> 'the' everywhere in essay.txt."
+[files]
+"essay.txt" = "teh cat sat on teh mat.\nIt was teh best day.\n"
+[check]
+command = "! grep -q teh essay.txt && grep -q 'the cat sat on the mat' essay.txt"

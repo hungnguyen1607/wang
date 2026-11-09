@@ -1,0 +1,26 @@
+[package]
+name = "wang-daemon"
+description = "wang daemon: agent loop, model clients, tools, channels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wang-tokens = { path = "../wang-tokens" }
+wang-trace = { path = "../wang-trace" }
+wang-jail = { path = "../wang-jail" }
+wang-browser = { path = "../wang-browser" }
+wang-vm = { path = "../wang-vm" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+toml.workspace = true
+dirs.workspace = true
+regex.workspace = true
+futures.workspace = true
+tracing.workspace = true
+dotenvy.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
