@@ -27,18 +27,14 @@ use crate::model::ModelClient;
 use crate::notify::{Notice, Notify};
 use crate::protocol::ServerMsg;
 use crate::server::{Channel, Hub};
-use crate::voice::{Speech, VOICE_GUIDANCE, approval_intent, spoken_part};
 
 /// Telegram's limit is 4096; keep room for a status line.
 const MAX_CHARS: usize = 3900;
 const EDIT_EVERY: Duration = Duration::from_millis(1200);
-/// Telegram's bot-file size limit.
-const MAX_FILE: usize = 20 * 1024 * 1024;
 
 pub struct Bot {
     http: reqwest::Client,
     base: String,
-    files: String,
 }
 
 impl Bot {
@@ -48,9 +44,7 @@ impl Bot {
         }
         // Longer than getUpdates' 50 s long poll.
         let http = reqwest::Client::builder().timeout(Duration::from_secs(75)).connect_timeout(Duration::from_secs(15)).build()?;
-        let base = format!("{}/bot{}", api_base.trim_end_matches('/'), token.trim());
-        let files = format!("{}/file/bot{}", api_base.trim_end_matches('/'), token.trim());
-        Ok(Self { http, base, files })
+        Ok(Self { http, base: format!("{}/bot{}", api_base.trim_end_matches('/'), token.trim()) })
     }
 
     /// Call a Bot API method. Retries on 429 (flood control) using Telegram's retry_after.
@@ -104,54 +98,6 @@ impl Bot {
             self.send_text(chat, &part, None).await?;
         }
         Ok(())
-    }
-
-    /// Download a file (voice note) by id. Capped at Telegram's 20 MB bot limit.
-    pub async fn download_file(&self, file_id: &str) -> Result<Vec<u8>> {
-        let r = self.call("getFile", json!({"file_id": file_id})).await?;
-        if let Some(size) = r["file_size"].as_u64()
-            && size as usize > MAX_FILE
-        {
-            bail!("telegram getFile: file too large ({size} bytes)");
-        }
-        let path = r["file_path"].as_str().context("telegram getFile: no file_path")?;
-        let resp = self
-            .http
-            .get(format!("{}/{}", self.files, path))
-            .send()
-            .await
-            .map_err(|e| anyhow!("telegram download: {}", e.without_url()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            bail!("telegram download: HTTP {status}");
-        }
-        let bytes = resp.bytes().await.map_err(|e| anyhow!("telegram download: {}", e.without_url()))?;
-        if bytes.len() > MAX_FILE {
-            bail!("telegram download: file too large ({} bytes)", bytes.len());
-        }
-        Ok(bytes.to_vec())
-    }
-
-    /// Send an OGG/Opus voice note. Returns the message id.
-    pub async fn send_voice(&self, chat: i64, ogg: Vec<u8>, caption: Option<String>) -> Result<i64> {
-        let part = reqwest::multipart::Part::bytes(ogg).file_name("voice.ogg").mime_str("audio/ogg").map_err(|e| anyhow!("telegram sendVoice: {e}"))?;
-        let mut form = reqwest::multipart::Form::new().part("voice", part).text("chat_id", chat.to_string());
-        if let Some(c) = caption {
-            form = form.text("caption", c);
-        }
-        let resp = self
-            .http
-            .post(format!("{}/sendVoice", self.base))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| anyhow!("telegram sendVoice: {}", e.without_url()))?;
-        let status = resp.status();
-        let v: Value = resp.json().await.map_err(|e| anyhow!("telegram sendVoice: {}", e.without_url()))?;
-        if v["ok"] != true {
-            bail!("telegram sendVoice (HTTP {status}): {}", v["description"].as_str().unwrap_or("unknown error"));
-        }
-        v["result"]["message_id"].as_i64().context("telegram sendVoice: no message_id")
     }
 }
 
@@ -239,27 +185,18 @@ pub struct TelegramChannel {
     pub stream: bool,
     /// The notifier already sends approval buttons; don't send them twice.
     pub buttons_via_notifier: bool,
-    /// Cloud speech, when `[voice]` is on; `None` = voice notes are refused politely.
-    pub speech: Option<Arc<dyn Speech>>,
-    /// Refuse voice notes longer than this (seconds).
-    pub max_seconds: u32,
     last_task: Arc<StdMutex<HashMap<i64, i64>>>,
-    /// chat id → approval id, so a spoken or typed "yes"/"no" can answer it.
-    pending: Arc<StdMutex<HashMap<i64, String>>>,
     warned: StdMutex<HashSet<i64>>,
 }
 
 impl TelegramChannel {
-    pub fn new(bot: Arc<Bot>, cfg: &TelegramCfg, buttons_via_notifier: bool, speech: Option<Arc<dyn Speech>>, max_seconds: u32) -> Self {
+    pub fn new(bot: Arc<Bot>, cfg: &TelegramCfg, buttons_via_notifier: bool) -> Self {
         Self {
             bot,
             allowed: cfg.allowed_user_ids.clone(),
             stream: cfg.stream,
             buttons_via_notifier,
-            speech,
-            max_seconds: max_seconds.max(1),
             last_task: Default::default(),
-            pending: Default::default(),
             warned: Default::default(),
         }
     }
@@ -349,20 +286,8 @@ impl TelegramChannel {
             tracing::warn!("telegram: ignored a message in non-private chat {chat}; wang only answers in a private chat");
             return;
         }
-        // Voice and audio notes have no `text` field; handle them in a spawned task so a
-        // slow download or transcription never stalls the poll loop.
-        if let Some(voice) = m.get("voice").or_else(|| m.get("audio")) {
-            let (hub, bot, last_task) = (hub.clone(), self.bot.clone(), self.last_task.clone());
-            let (stream, own_buttons) = (self.stream, !self.buttons_via_notifier);
-            let (speech, pending) = (self.speech.clone(), self.pending.clone());
-            let (max_seconds, m, voice) = (self.max_seconds, m.clone(), voice.clone());
-            tokio::spawn(async move {
-                handle_voice(hub, bot, chat, m, voice, stream, own_buttons, last_task, speech, pending, max_seconds).await;
-            });
-            return;
-        }
         let Some(text) = m["text"].as_str().map(str::trim).filter(|t| !t.is_empty()) else {
-            self.reply(chat, "I read text and voice messages.").await;
+            self.reply(chat, "I only read text messages for now.").await;
             return;
         };
         let session = format!("tg-{chat}");
@@ -455,26 +380,10 @@ impl TelegramChannel {
                     Some(w) => format!("/{w} {arg}"),
                     None => text.to_string(),
                 };
-                // A typed "yes"/"no" answers this chat's pending approval.
-                if let Some(allow) = approval_intent(&text) {
-                    let pending_id = self.pending.lock().unwrap().get(&chat).cloned();
-                    if let Some(id) = pending_id {
-                        let ok = hub.agent.approvals.as_ref().is_some_and(|a| a.resolve(&id, allow));
-                        self.pending.lock().unwrap().remove(&chat);
-                        let mark = match (ok, allow) {
-                            (true, true) => "✅ Approved",
-                            (true, false) => "❌ Denied",
-                            (false, _) => "⌛ Already answered or expired.",
-                        };
-                        self.reply(chat, mark).await;
-                        return;
-                    }
-                }
                 let (hub, bot, last_task) = (hub.clone(), self.bot.clone(), self.last_task.clone());
                 let (stream, own_buttons) = (self.stream, !self.buttons_via_notifier);
-                let (speech, pending) = (self.speech.clone(), self.pending.clone());
                 tokio::spawn(async move {
-                    run_turn(hub, bot, chat, session, text, stream, own_buttons, last_task, speech, pending, false).await;
+                    run_turn(hub, bot, chat, session, text, stream, own_buttons, last_task).await;
                 });
             }
         }
@@ -515,97 +424,6 @@ impl TelegramChannel {
     }
 }
 
-/// A voice note → transcribe → run a turn with voice guidance. Runs in its own task so a slow
-/// download or speech call never stalls the poll loop (button taps and other chats keep flowing).
-#[allow(clippy::too_many_arguments)]
-async fn handle_voice<C: ModelClient>(
-    hub: Arc<Hub<C>>,
-    bot: Arc<Bot>,
-    chat: i64,
-    m: Value,
-    voice: Value,
-    stream: bool,
-    own_buttons: bool,
-    last_task: Arc<StdMutex<HashMap<i64, i64>>>,
-    speech: Option<Arc<dyn Speech>>,
-    pending: Arc<StdMutex<HashMap<i64, String>>>,
-    max_seconds: u32,
-) {
-    let reply = |text: &str| {
-        let bot = bot.clone();
-        let text = text.to_string();
-        async move {
-            if let Err(e) = bot.send_long(chat, &text).await {
-                tracing::warn!("telegram reply failed: {e:#}");
-            }
-        }
-    };
-    let Some(speech) = speech else {
-        reply("Voice is off. Set [voice] enabled = true and OPENAI_API_KEY in ~/.config/wang/.env, or send a text message.").await;
-        return;
-    };
-    let dur = voice["duration"].as_u64().unwrap_or(0);
-    if dur > max_seconds as u64 {
-        reply(&format!("That voice note is too long ({dur}s); keep it under {max_seconds}s.")).await;
-        return;
-    }
-    let Some(file_id) = voice["file_id"].as_str() else {
-        reply("Couldn't read that voice note.").await;
-        return;
-    };
-    let bytes = match bot.download_file(file_id).await {
-        Ok(b) => b,
-        Err(e) => {
-            reply(&format!("Couldn't download that voice note: {e:#}")).await;
-            return;
-        }
-    };
-    let mime = if m.get("voice").is_some() {
-        "audio/ogg"
-    } else {
-        m.get("audio").and_then(|a| a["mime_type"].as_str()).unwrap_or("audio/mpeg")
-    };
-    let t = match speech.transcribe(bytes.clone(), mime).await {
-        Ok(t) => t,
-        Err(e) => {
-            reply(&format!("Couldn't hear that: {e:#}")).await;
-            return;
-        }
-    };
-    // Meter the transcription as a tool call (a small "voice" task, excluded from latest_task).
-    let ledger = &hub.agent.ledger;
-    let Ok(vtask) = ledger.start_task("voice", &format!("voice note ({dur}s)")) else { return };
-    let _ = ledger.record_tool(vtask, &wang_tokens::ToolRecord {
-        name: "voice_stt",
-        detail: &format!("{dur}s"),
-        raw_bytes: bytes.len(),
-        sent_bytes: bytes.len(),
-        ms: t.ms,
-        ..Default::default()
-    });
-    let _ = ledger.finish_task(vtask, 0, "ok");
-    // Echo the transcript so a mishearing is visible.
-    reply(&format!("🎤 \"{}\"", t.text.trim())).await;
-    // A spoken "yes"/"no" answers this chat's pending approval.
-    if let Some(allow) = approval_intent(&t.text) {
-        let pending_id = pending.lock().unwrap().get(&chat).cloned();
-        if let Some(id) = pending_id {
-            let ok = hub.agent.approvals.as_ref().is_some_and(|a| a.resolve(&id, allow));
-            pending.lock().unwrap().remove(&chat);
-            let mark = match (ok, allow) {
-                (true, true) => "✅ Approved",
-                (true, false) => "❌ Denied",
-                (false, _) => "⌛ Already answered or expired.",
-            };
-            reply(mark).await;
-            return;
-        }
-    }
-    let session = format!("tg-{chat}");
-    let text = format!("{}\n\n[voice] {VOICE_GUIDANCE}", t.text.trim());
-    run_turn(hub, bot, chat, session, text, stream, own_buttons, last_task, Some(speech), pending, true).await;
-}
-
 /// One user message → one agent turn, rendered live into the chat.
 #[allow(clippy::too_many_arguments)]
 async fn run_turn<C: ModelClient>(
@@ -617,12 +435,8 @@ async fn run_turn<C: ModelClient>(
     stream: bool,
     own_buttons: bool,
     last_task: Arc<StdMutex<HashMap<i64, i64>>>,
-    speech: Option<Arc<dyn Speech>>,
-    pending: Arc<StdMutex<HashMap<i64, String>>>,
-    from_voice: bool,
 ) {
-    let action = if from_voice { "record_voice" } else { "typing" };
-    let _ = bot.call("sendChatAction", json!({"chat_id": chat, "action": action})).await;
+    let _ = bot.call("sendChatAction", json!({"chat_id": chat, "action": "typing"})).await;
     let conv = hub.session(&session).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerMsg>();
     let hub2 = hub.clone();
@@ -633,7 +447,7 @@ async fn run_turn<C: ModelClient>(
         };
         hub2.agent.run_turn(&mut conv, "telegram", &text, &emit).await
     };
-    let mut live = Live { bot: bot.clone(), chat, stream, own_buttons, msg: None, text: String::new(), status: None, shown: String::new(), pending: pending.clone() };
+    let mut live = Live { bot, chat, stream, own_buttons, msg: None, text: String::new(), status: None, shown: String::new() };
     let render = async {
         let mut tick = tokio::time::interval(EDIT_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -652,35 +466,9 @@ async fn run_turn<C: ModelClient>(
         Ok(r) => {
             last_task.lock().unwrap().insert(chat, r.task_id);
             live.finish(Some(r.footer())).await;
-            if from_voice && let Some(sp) = &speech {
-                let (spoken, _) = spoken_part(&r.reply);
-                if !spoken.is_empty() {
-                    let started = std::time::Instant::now();
-                    match sp.speak(&spoken).await {
-                        Ok(ogg) => {
-                            let _ = hub.agent.ledger.record_tool(r.task_id, &wang_tokens::ToolRecord {
-                                name: "voice_tts",
-                                detail: &format!("{} chars", spoken.chars().count()),
-                                raw_bytes: ogg.len(),
-                                sent_bytes: ogg.len(),
-                                ms: started.elapsed().as_millis() as u64,
-                                ..Default::default()
-                            });
-                            if let Err(e) = bot.send_voice(chat, ogg, None).await {
-                                tracing::warn!("telegram sendVoice failed: {e:#}");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("voice tts failed: {e:#}");
-                            let _ = bot.send_text(chat, "(couldn't speak the answer — the text above is the full reply.)", None).await;
-                        }
-                    }
-                }
-            }
         }
         Err(e) => {
             tracing::error!("telegram task failed: {e:#}");
-            pending.lock().unwrap().remove(&chat);
             live.text = format!("{}\n\nError: {e:#}", live.text.trim()).trim().to_string();
             live.finish(None).await;
         }
@@ -697,8 +485,6 @@ struct Live {
     text: String,
     status: Option<String>,
     shown: String,
-    /// chat id → approval id, so a spoken or typed "yes"/"no" can answer it.
-    pending: Arc<StdMutex<HashMap<i64, String>>>,
 }
 
 fn clip(s: &str, n: usize) -> String {
@@ -712,7 +498,6 @@ impl Live {
             ServerMsg::ToolStart { name, detail } => self.status = Some(format!("⚙ {name}: {}", clip(&detail, 200))),
             ServerMsg::ToolEnd { .. } => self.status = None,
             ServerMsg::ApprovalRequest { id, tool, detail } => {
-                self.pending.lock().unwrap().insert(self.chat, id.clone());
                 self.status = Some(format!("⏳ waiting for your approval: {tool}"));
                 self.flush().await;
                 if self.own_buttons {
@@ -722,10 +507,7 @@ impl Live {
                     }
                 }
             }
-            ServerMsg::ApprovalResult { .. } => {
-                self.pending.lock().unwrap().remove(&self.chat);
-                self.status = None;
-            }
+            ServerMsg::ApprovalResult { .. } => self.status = None,
             _ => {}
         }
     }

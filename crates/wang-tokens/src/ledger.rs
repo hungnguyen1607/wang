@@ -162,7 +162,7 @@ impl Ledger {
     }
 
     pub fn latest_task(&self) -> Result<Option<i64>> {
-        Ok(self.conn.lock().unwrap().query_row("SELECT MAX(id) FROM tasks WHERE source NOT LIKE 'proxy:%' AND source NOT LIKE 'worker:%' AND source NOT LIKE 'voice:%'", [], |r| r.get(0)).optional()?.flatten())
+        Ok(self.conn.lock().unwrap().query_row("SELECT MAX(id) FROM tasks WHERE source NOT LIKE 'proxy:%' AND source NOT LIKE 'worker:%'", [], |r| r.get(0)).optional()?.flatten())
     }
 
     /// Record a model call; returns the cost in USD that was recorded.

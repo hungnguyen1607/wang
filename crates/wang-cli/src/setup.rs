@@ -38,69 +38,10 @@ fn exe() -> PathBuf {
 /// Is `wang mcp` registered with Claude Code (user scope)? Read-only: looks at ~/.claude.json.
 pub fn claude_has_wang() -> bool {
     let Some(home) = dirs::home_dir() else { return false };
-    read_json_has_wang(&home.join(".claude.json"))
-}
-
-/// Cursor's global MCP config.
-pub fn cursor_mcp_path() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".cursor/mcp.json"))
-}
-
-/// Claude Desktop's config (MCP servers live under `mcpServers`).
-pub fn claude_desktop_config_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("Claude/claude_desktop_config.json"))
-}
-
-/// Codex's config; `codex mcp add wang -- wang mcp` writes `[mcp_servers.wang]` here.
-pub fn codex_config_path() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".codex/config.toml"))
-}
-
-pub fn cursor_has_wang() -> bool {
-    cursor_mcp_path().is_some_and(|p| read_json_has_wang(&p))
-}
-
-pub fn claude_desktop_has_wang() -> bool {
-    claude_desktop_config_path().is_some_and(|p| read_json_has_wang(&p))
-}
-
-pub fn codex_has_wang() -> bool {
-    codex_config_path().and_then(|p| std::fs::read_to_string(p).ok()).is_some_and(|s| s.contains("mcp_servers") && s.contains("wang"))
-}
-
-fn read_json_has_wang(path: &Path) -> bool {
-    std::fs::read_to_string(path)
+    std::fs::read_to_string(home.join(".claude.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .is_some_and(|v| v["mcpServers"].get("wang").is_some())
-}
-
-/// Add `wang mcp` to a JSON config's `mcpServers`, keeping every other key. Backs up the old file.
-fn ensure_mcp_json(path: &Path, exe: &Path) -> Result<()> {
-    let mut root: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display()))?,
-        _ => serde_json::json!({}),
-    };
-    if !root.is_object() {
-        bail!("{} is not a JSON object", path.display());
-    }
-    if path.exists() {
-        let _ = std::fs::copy(path, path.with_extension("json.bak"));
-    }
-    let obj = root.as_object_mut().unwrap();
-    let servers = obj.entry("mcpServers").or_insert_with(|| serde_json::json!({}));
-    if !servers.is_object() {
-        *servers = serde_json::json!({});
-    }
-    servers.as_object_mut().unwrap().insert(
-        "wang".into(),
-        serde_json::json!({"command": exe.to_string_lossy(), "args": ["mcp"]}),
-    );
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    std::fs::write(path, serde_json::to_string_pretty(&root)? + "\n")?;
-    Ok(())
 }
 
 pub fn api_key_set() -> bool {
@@ -120,41 +61,17 @@ pub async fn doctor(cfg: &Config) -> Vec<Check> {
         },
         Err(e) => add("sandbox", Level::Missing, format!("{e:#}"), Some("sudo apt install bubblewrap")),
     }
-    // Brains: an agent app (via MCP) and/or an API key for wang's own agent.
+    // Brains: Claude Code (via MCP) and/or an API key for wang's own agent.
     let claude = which("claude");
     match (&claude, claude_has_wang()) {
         (Some(_), true) => add("Claude Code", Level::Ok, "wang is plugged in (`wang mcp`)".into(), None),
         (Some(_), false) => add("Claude Code", Level::Off, "installed, wang not plugged in".into(), Some("wang setup   (or: claude mcp add --scope user wang -- wang mcp)")),
         (None, _) => add("Claude Code", Level::Off, "not installed".into(), Some("optional: https://claude.com/claude-code, then `wang setup`")),
     }
-    let codex = which("codex");
-    match (&codex, codex_has_wang()) {
-        (Some(_), true) => add("Codex", Level::Ok, "wang is plugged in (`wang mcp`)".into(), None),
-        (Some(_), false) => add("Codex", Level::Off, "installed, wang not plugged in".into(), Some("wang setup   (or: codex mcp add wang -- wang mcp)")),
-        (None, _) => add("Codex", Level::Off, "not installed".into(), Some("optional: https://github.com/openai/codex, then `wang setup`")),
-    }
-    let cursor = which("cursor").is_some() || cursor_mcp_path().is_some_and(|p| p.parent().is_some_and(|d| d.exists()));
-    match (cursor, cursor_has_wang()) {
-        (true, true) => add("Cursor", Level::Ok, "wang is plugged in (`wang mcp`)".into(), None),
-        (true, false) => add("Cursor", Level::Off, "installed, wang not plugged in".into(), Some("wang setup")),
-        (false, _) => add("Cursor", Level::Off, "not installed".into(), Some("optional: https://cursor.com, then `wang setup`")),
-    }
-    let desktop = which("claude-desktop").is_some() || claude_desktop_config_path().is_some_and(|p| p.exists());
-    match (desktop, claude_desktop_has_wang()) {
-        (true, true) => add("Claude Desktop", Level::Ok, "wang is plugged in (`wang mcp`)".into(), None),
-        (true, false) => add("Claude Desktop", Level::Off, "installed, wang not plugged in".into(), Some("add wang to its MCP config (see README)")),
-        (false, _) => add("Claude Desktop", Level::Off, "not installed".into(), Some("optional: https://claude.ai/download")),
-    }
     if api_key_set() {
         add("API key", Level::Ok, "set: wang's own agent can run (terminal, Telegram)".into(), None);
     } else {
-        add("API key", Level::Off, "not set: wang's own agent is off; use wang from your agent over MCP instead".into(), Some(&format!("put OPENROUTER_API_KEY=... in {}", config::env_path().display())));
-    }
-    // Voice (hands-free): cloud speech with your own key.
-    let voice = cfg.voice.to_cfg();
-    match voice.status() {
-        ("on", _) => add("voice", Level::Ok, format!("{} / {}", cfg.voice.stt_model, cfg.voice.tts_model), Some("wang voice test")),
-        (_, why) => add("voice", Level::Off, format!("off: {why}"), Some("set [voice] enabled = true and OPENAI_API_KEY in ~/.config/wang/.env")),
+        add("API key", Level::Off, "not set: wang's own agent is off; use wang from Claude instead".into(), Some(&format!("put OPENROUTER_API_KEY=... in {}", config::env_path().display())));
     }
     // Optional infrastructure.
     match wang_browser::find_chrome() {
@@ -278,47 +195,15 @@ pub async fn setup(cfg_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // 1. Connect wang as an MCP server to the agent apps that are installed.
-    // Claude Code: the no-API-key way to use wang.
+    // 1. Claude Code: the no-API-key way to use wang.
     if which("claude").is_some() && !claude_has_wang() {
-        println!("\nClaude Code is installed. Connecting wang gives Claude a sandboxed shell, browser and VMs, using your own Claude login (no API key).");
-        if yes(&ask("Connect wang as an MCP server to Claude Code? [Y/n] ", &mut lines), true) {
+        println!("\nClaude Code is installed. Plugging wang in gives Claude a sandboxed shell, browser and VMs, using your own Claude login (no API key).");
+        if yes(&ask("Add wang to Claude Code? [Y/n] ", &mut lines), true) {
             let exe = exe();
             let st = Command::new("claude").args(["mcp", "add", "--scope", "user", "wang", "--"]).arg(&exe).arg("mcp").status();
             match st {
-                Ok(s) if s.success() => println!("  ✓ connected: in Claude Code, ask e.g. \"use wang's VM to try this script\""),
-                _ => println!("  couldn't connect it; run: claude mcp add --scope user wang -- {} mcp", exe.display()),
-            }
-        }
-    }
-    if which("codex").is_some() && !codex_has_wang() {
-        println!("\nCodex is installed. Connecting wang gives Codex a sandboxed shell, browser and VMs.");
-        if yes(&ask("Connect wang as an MCP server to Codex? [Y/n] ", &mut lines), true) {
-            let exe = exe();
-            let st = Command::new("codex").args(["mcp", "add", "wang", "--"]).arg(&exe).arg("mcp").status();
-            match st {
-                Ok(s) if s.success() => println!("  ✓ connected: in Codex, ask it to use wang"),
-                _ => println!("  couldn't connect it; run: codex mcp add wang -- {} mcp", exe.display()),
-            }
-        }
-    }
-    let cursor_installed = which("cursor").is_some() || cursor_mcp_path().is_some_and(|p| p.parent().is_some_and(|d| d.exists()));
-    if cursor_installed && !cursor_has_wang() && let Some(path) = cursor_mcp_path() {
-        println!("\nCursor is installed. Connecting wang gives Cursor a sandboxed shell, browser and VMs.");
-        if yes(&ask("Connect wang as an MCP server to Cursor? [Y/n] ", &mut lines), true) {
-            match ensure_mcp_json(&path, &exe()) {
-                Ok(()) => println!("  ✓ connected ({})", path.display()),
-                Err(e) => println!("  couldn't connect it: {e:#}"),
-            }
-        }
-    }
-    let desktop_installed = which("claude-desktop").is_some() || claude_desktop_config_path().is_some_and(|p| p.exists());
-    if desktop_installed && !claude_desktop_has_wang() && let Some(path) = claude_desktop_config_path() {
-        println!("\nClaude Desktop is installed. Connecting wang gives it a sandboxed shell, browser and VMs.");
-        if yes(&ask("Connect wang as an MCP server to Claude Desktop? [Y/n] ", &mut lines), true) {
-            match ensure_mcp_json(&path, &exe()) {
-                Ok(()) => println!("  ✓ connected ({})", path.display()),
-                Err(e) => println!("  couldn't connect it: {e:#}"),
+                Ok(s) if s.success() => println!("  ✓ added: in Claude Code, ask e.g. \"use wang's VM to try this script\""),
+                _ => println!("  couldn't add it; run: claude mcp add --scope user wang -- {} mcp", exe.display()),
             }
         }
     }
@@ -356,10 +241,6 @@ pub async fn setup(cfg_path: &Path) -> Result<()> {
         println!("Run `wang` to chat.");
     } else if claude_has_wang() {
         println!("Open Claude Code and ask it to use wang.");
-    } else if codex_has_wang() {
-        println!("Open Codex and ask it to use wang.");
-    } else if cursor_has_wang() || claude_desktop_has_wang() {
-        println!("Open your agent app and ask it to use wang.");
     }
     Ok(())
 }
@@ -401,37 +282,4 @@ pub async fn ensure_daemon() -> Result<()> {
         "the wang daemon didn't start; see {}",
         if via_systemd { "journalctl --user -u wang".to_string() } else { log.display().to_string() }
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ensure_mcp_json_creates_and_preserves() {
-        let dir = std::env::temp_dir().join(format!("wang-mcp-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mcp.json");
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("json.bak"));
-        assert!(!read_json_has_wang(&path));
-
-        // Creates the file with the wang entry.
-        ensure_mcp_json(&path, Path::new("/usr/bin/wang")).unwrap();
-        assert!(read_json_has_wang(&path));
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v["mcpServers"]["wang"]["command"], "/usr/bin/wang");
-        assert_eq!(v["mcpServers"]["wang"]["args"][0], "mcp");
-
-        // Keeps other keys and other servers, and backs the old file up.
-        std::fs::write(&path, r#"{"preferences":{"a":1},"mcpServers":{"other":{"command":"x","args":[]}}}"#).unwrap();
-        ensure_mcp_json(&path, Path::new("/opt/wang")).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v["preferences"]["a"], 1);
-        assert_eq!(v["mcpServers"]["other"]["command"], "x");
-        assert_eq!(v["mcpServers"]["wang"]["command"], "/opt/wang");
-        assert!(path.with_extension("json.bak").exists());
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
 }
