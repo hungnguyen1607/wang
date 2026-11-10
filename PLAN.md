@@ -107,6 +107,9 @@ wang-evals (recorded tasks, exact replay)   wang-bench (fake model server, 1→1
     `wang` starts the daemon and opens chat.
   - Release packaging and CI workflows (written; they run once the repo is on GitHub).
   - A landing page.
+- **M13: Voice.** Hands-free use while walking. Telegram voice notes in (cloud speech-to-text, the user's key);
+  answers as a short spoken voice note plus the details as text; spoken approvals ("yes" or "no"); scheduled
+  results can be spoken. English first. Level 2 (later): Siri/Google shortcut. Level 3 (maybe): a phone number.
 - **Next (not started):** integrations (email, calendar), more chat apps, skills; the live-model run and evals; a
   security pass; a rename (done 2026-11-08: warp → wang, since "Warp" was taken).
 

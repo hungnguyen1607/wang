@@ -125,7 +125,7 @@ async fn due_task_runs_through_the_agent_and_is_delivered() {
     let hub = Hub::new(agent);
     let store = Store::in_memory().unwrap();
     let inbox = Arc::new(Inbox::default());
-    let delivery = Delivery { bot: None, notifier: Some(inbox.clone()) };
+    let delivery = Delivery { bot: None, notifier: Some(inbox.clone()), speech: None, speak_schedules: false };
     // Due now (made "in 10 minutes" from 10 minutes ago).
     let s = store.add("in 10 minutes", "summarize hacker news", "cli", Local::now() - CDuration::minutes(10)).unwrap();
     let due = store.due(Local::now()).unwrap();
@@ -154,7 +154,7 @@ async fn long_missed_runs_are_skipped_not_run() {
     );
     let hub = Hub::new(agent);
     let store = Store::in_memory().unwrap();
-    let delivery = Delivery { bot: None, notifier: None };
+    let delivery = Delivery { bot: None, notifier: None, speech: None, speak_schedules: false };
     store.add("every day at 8:00", "daily brief", "cli", Local::now() - CDuration::days(3)).unwrap();
     let due = store.due(Local::now()).unwrap();
     assert_eq!(run_one(&hub, &store, &delivery, &due[0]).await.unwrap(), "missed");

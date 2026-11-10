@@ -15,6 +15,7 @@ pub mod schedule;
 pub mod server;
 pub mod telegram;
 pub mod tools;
+pub mod voice;
 pub mod workflow;
 
 pub use agent::{Agent, Conversation};

@@ -15,6 +15,7 @@ pub struct Config {
     pub memory: MemoryCfg,
     pub routing: RoutingCfg,
     pub telegram: TelegramCfg,
+    pub voice: VoiceConfig,
     pub browser: BrowserConfig,
     pub vm: VmConfig,
     pub local: LocalConfig,
@@ -229,6 +230,59 @@ pub struct TelegramCfg {
 impl Default for TelegramCfg {
     fn default() -> Self {
         Self { allowed_user_ids: vec![], stream: true, alerts: true, api_base: "https://api.telegram.org".into() }
+    }
+}
+
+/// `[voice]`: hands-free use. Telegram voice notes in (cloud speech-to-text, your own key) and a
+/// short spoken answer out. Off by default; the key is OPENAI_API_KEY (or GROQ_API_KEY for STT).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VoiceConfig {
+    pub enabled: bool,
+    /// Speech-to-text endpoint and model (OpenAI-compatible; Groq works too).
+    pub stt_base: String,
+    pub stt_model: String,
+    /// Text-to-speech endpoint, model and voice.
+    pub tts_base: String,
+    pub tts_model: String,
+    pub tts_voice: String,
+    /// Environment variable that holds the API key.
+    pub api_key_env: String,
+    /// Refuse voice notes longer than this (seconds).
+    pub max_seconds: u32,
+    /// Also speak scheduled results delivered to a Telegram chat.
+    pub speak_schedules: bool,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stt_base: "https://api.openai.com/v1".into(),
+            stt_model: "gpt-4o-mini-transcribe".into(),
+            tts_base: "https://api.openai.com/v1".into(),
+            tts_model: "gpt-4o-mini-tts".into(),
+            tts_voice: "alloy".into(),
+            api_key_env: "OPENAI_API_KEY".into(),
+            max_seconds: 120,
+            speak_schedules: false,
+        }
+    }
+}
+
+impl VoiceConfig {
+    pub fn to_cfg(&self) -> crate::voice::VoiceCfg {
+        crate::voice::VoiceCfg {
+            enabled: self.enabled,
+            stt_base: self.stt_base.clone(),
+            stt_model: self.stt_model.clone(),
+            tts_base: self.tts_base.clone(),
+            tts_model: self.tts_model.clone(),
+            tts_voice: self.tts_voice.clone(),
+            api_key_env: self.api_key_env.clone(),
+            max_seconds: self.max_seconds.clamp(1, 600),
+            speak_schedules: self.speak_schedules,
+        }
     }
 }
 
@@ -523,13 +577,24 @@ allowed_user_ids = []                    # your numeric id; message the bot once
 stream = true                            # edit the reply live as it's written
 alerts = true                            # alerts + Approve/Deny buttons for every session go to Telegram too
 
+[voice]                                  # hands-free: voice notes in, a short spoken answer out
+enabled = false                          # needs OPENAI_API_KEY in .env (audio goes to the speech provider)
+stt_base = "https://api.openai.com/v1"   # speech-to-text (OpenAI-compatible; Groq: https://api.groq.com/openai/v1)
+stt_model = "gpt-4o-mini-transcribe"     # Groq STT: whisper-large-v3-turbo, key GROQ_API_KEY
+tts_base = "https://api.openai.com/v1"
+tts_model = "gpt-4o-mini-tts"
+tts_voice = "alloy"
+api_key_env = "OPENAI_API_KEY"
+max_seconds = 120                        # longer voice notes are refused
+speak_schedules = false                  # true = scheduled results to Telegram also arrive as a voice note
+
 [ntfy]
 server = "https://ntfy.sh"
 topic = ""                               # empty = alerts off; use a long random name on ntfy.sh
 # access token (optional): NTFY_TOKEN in .env
 "#;
 
-pub const EXAMPLE_ENV: &str = "# wang secrets — keep this file chmod 600\nOPENROUTER_API_KEY=\n# ANTHROPIC_API_KEY=\n# NTFY_TOKEN=\n# TELEGRAM_BOT_TOKEN=\n";
+pub const EXAMPLE_ENV: &str = "# wang secrets — keep this file chmod 600\nOPENROUTER_API_KEY=\n# ANTHROPIC_API_KEY=\n# NTFY_TOKEN=\n# TELEGRAM_BOT_TOKEN=\n# OPENAI_API_KEY=\n";
 
 fn config_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("wang")

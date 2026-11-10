@@ -1,0 +1,17 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: sandbox prerequisites
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 restricts unprivileged user namespaces; bwrap's AppArmor profile may be missing on runners.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - run: cargo build --workspace
+      - run: cargo build -p wang-jail --bin jail
+      # Tests needing KVM, Chrome or VM assets skip themselves when those aren't present.
+      - run: cargo test --workspace

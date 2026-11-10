@@ -2,6 +2,7 @@ use super::*;
 use crate::agent::tests::agent;
 use crate::approvals::Approvals;
 use crate::model::testing::{Mock, resp};
+use crate::voice::Transcript;
 use std::collections::VecDeque;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -43,6 +44,16 @@ impl FakeTg {
                             buf.extend_from_slice(&chunk[..n]);
                         }
                         let path = head.split_whitespace().nth(1).unwrap().to_string();
+                        // File downloads go through /file/bot<token>/..., not a JSON method.
+                        if path.starts_with("/file/botTEST:token/") {
+                            let out = b"OGG".to_vec();
+                            let r = format!("HTTP/1.1 200 OK\r\ncontent-type: audio/ogg\r\ncontent-length: {}\r\n\r\n", out.len());
+                            if s.write_all(r.as_bytes()).await.is_err() || s.write_all(&out).await.is_err() {
+                                return;
+                            }
+                            buf.drain(..he + len);
+                            continue;
+                        }
                         let method = path.rsplit('/').next().unwrap().to_string();
                         assert!(path.starts_with("/botTEST:token/"), "{path}");
                         let body: Value = serde_json::from_slice(&buf[he..he + len]).unwrap_or(Value::Null);
@@ -75,6 +86,12 @@ impl FakeTg {
                 let mut n = self.next_msg.lock().unwrap();
                 *n += 1;
                 json!({"message_id": *n, "chat": {"id": body["chat_id"]}})
+            }
+            "getFile" => json!({"file_path": "voices/F1.ogg", "file_size": 123}),
+            "sendVoice" => {
+                let mut n = self.next_msg.lock().unwrap();
+                *n += 1;
+                json!({"message_id": *n})
             }
             _ => json!(true),
         }
@@ -117,7 +134,7 @@ fn msg(update_id: i64, from: i64, chat_type: &str, text: &str) -> Value {
 fn channel(base: &str, stream: bool, via_notifier: bool) -> TelegramChannel {
     let bot = Arc::new(Bot::new(base, "TEST:token").unwrap());
     let cfg = TelegramCfg { allowed_user_ids: vec![42], stream, ..Default::default() };
-    TelegramChannel::new(bot, &cfg, via_notifier)
+    TelegramChannel::new(bot, &cfg, via_notifier, None, 120)
 }
 
 #[test]
@@ -242,7 +259,7 @@ async fn long_streamed_reply_rolls_over_into_new_messages() {
     let tg = FakeTg::default();
     let base = tg.start().await;
     let bot = Arc::new(Bot::new(&base, "TEST:token").unwrap());
-    let mut live = Live { bot, chat: 42, stream: true, own_buttons: false, msg: None, text: String::new(), status: None, shown: String::new() };
+    let mut live = Live { bot, chat: 42, stream: true, own_buttons: false, msg: None, text: String::new(), status: None, shown: String::new(), pending: Default::default() };
     live.on_event(ServerMsg::Text { delta: "line\n".repeat(900) }).await; // 4500 chars
     live.on_event(ServerMsg::ToolStart { name: "shell".into(), detail: "ls".into() }).await;
     live.flush().await;
@@ -257,4 +274,97 @@ async fn long_streamed_reply_rolls_over_into_new_messages() {
     assert!(last.ends_with("— footer") && !last.contains("⚙"), "{last}");
     let total: usize = [&texts[0], last].iter().map(|t| t.matches("line").count()).sum();
     assert_eq!(total, 900, "no text lost or duplicated across the rollover");
+}
+
+struct FakeSpeech {
+    transcript: String,
+    spoken: Arc<StdMutex<Vec<String>>>,
+}
+
+impl Speech for FakeSpeech {
+    fn transcribe<'a>(&'a self, _audio: Vec<u8>, _mime: &'a str) -> Pin<Box<dyn Future<Output = anyhow::Result<Transcript>> + Send + 'a>> {
+        let text = self.transcript.clone();
+        Box::pin(async move { Ok(Transcript { text, ms: 1 }) })
+    }
+
+    fn speak<'a>(&'a self, text: &'a str) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + 'a>> {
+        self.spoken.lock().unwrap().push(text.to_string());
+        Box::pin(async move { Ok(b"OGG".to_vec()) })
+    }
+}
+
+fn voice_msg(update_id: i64, from: i64, chat_type: &str, duration: u64) -> Value {
+    json!({"update_id": update_id, "message": {"message_id": update_id, "from": {"id": from, "username": "u"},
+           "chat": {"id": from, "type": chat_type}, "voice": {"file_id": "F1", "duration": duration}}})
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn voice_note_runs_a_turn_and_replies_with_voice() {
+    let tg = FakeTg::default();
+    let base = tg.start().await;
+    let speech = Arc::new(FakeSpeech { transcript: "say hi".into(), spoken: Default::default() });
+    let a = agent(Mock::new(vec![
+        resp(json!([{"type": "text", "text": "Hi there."}]), "end_turn", 0),
+    ]));
+    let hub = Arc::new(Hub::new(a));
+    let bot = Arc::new(Bot::new(&base, "TEST:token").unwrap());
+    let cfg = TelegramCfg { allowed_user_ids: vec![42], stream: false, ..Default::default() };
+    let server = tokio::spawn(TelegramChannel::new(bot, &cfg, false, Some(speech.clone()), 120).serve(hub.clone()));
+
+    tg.push(voice_msg(1, 42, "private", 3));
+    tg.wait_for("voice reply", |t| t.calls.lock().unwrap().iter().any(|(m, _)| m == "sendVoice")).await;
+
+    let texts = tg.texts();
+    assert!(texts.iter().any(|x| x.contains("🎤") && x.contains("say hi")), "{texts:?}");
+    assert!(texts.iter().any(|x| x.contains("Hi there.")), "{texts:?}");
+    assert!(speech.spoken.lock().unwrap().iter().any(|s| s.contains("Hi there.")));
+    let conv = hub.session("tg-42").await;
+    let msgs = conv.lock().await.messages.iter().any(|m| m.to_string().contains("say hi"));
+    assert!(msgs, "the agent received the transcript");
+    server.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn voice_ignores_strangers_and_long_clips() {
+    let tg = FakeTg::default();
+    let base = tg.start().await;
+    let speech = Arc::new(FakeSpeech { transcript: "x".into(), spoken: Default::default() });
+    let a = agent(Mock::new(vec![]));
+    let hub = Arc::new(Hub::new(a));
+    let bot = Arc::new(Bot::new(&base, "TEST:token").unwrap());
+    let cfg = TelegramCfg { allowed_user_ids: vec![42], stream: false, ..Default::default() };
+    let server = tokio::spawn(TelegramChannel::new(bot, &cfg, false, Some(speech), 120).serve(hub.clone()));
+
+    tg.push(voice_msg(1, 999, "private", 3)); // stranger
+    tg.push(voice_msg(2, 42, "private", 300)); // too long
+    tg.wait_for("refusal", |t| t.texts().iter().any(|x| x.contains("too long"))).await;
+
+    let texts = tg.texts();
+    assert!(texts.iter().any(|x| x.contains("too long")), "{texts:?}");
+    assert!(!texts.iter().any(|x| x.contains("🎤")), "stranger and long clips never reach speech: {texts:?}");
+    server.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn spoken_yes_resolves_pending_approval() {
+    let tg = FakeTg::default();
+    let base = tg.start().await;
+    let speech = Arc::new(FakeSpeech { transcript: "yes".into(), spoken: Default::default() });
+    let appr = Arc::new(Approvals::new(None, Duration::from_secs(5)));
+    let a = agent(Mock::new(vec![
+        resp(json!([{"type": "tool_use", "id": "t1", "name": "shell", "input": {"command": "echo hi"}}]), "tool_use", 0),
+        resp(json!([{"type": "text", "text": "fin"}]), "end_turn", 0),
+    ])).with_approvals(Some(appr));
+    let hub = Arc::new(Hub::new(a));
+    let bot = Arc::new(Bot::new(&base, "TEST:token").unwrap());
+    let cfg = TelegramCfg { allowed_user_ids: vec![42], stream: false, ..Default::default() };
+    let server = tokio::spawn(TelegramChannel::new(bot, &cfg, false, Some(speech), 120).serve(hub.clone()));
+
+    tg.push(msg(1, 42, "private", "run it"));
+    tg.wait_for("approval buttons", |t| t.sent().iter().any(|b| b.get("reply_markup").is_some())).await;
+    // Spoken "yes" resolves the approval.
+    tg.push(voice_msg(2, 42, "private", 2));
+    tg.wait_for("approved", |t| t.texts().iter().any(|x| x.contains("✅ Approved"))).await;
+    tg.wait_for("final reply", |t| t.texts().iter().any(|x| x.starts_with("fin"))).await;
+    server.abort();
 }

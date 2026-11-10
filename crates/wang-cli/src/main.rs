@@ -124,7 +124,7 @@ enum Cmd {
         #[command(subcommand)]
         action: ScheduleAction,
     },
-    /// Serve wang's tools to Claude Code / Claude Desktop (MCP over stdio): `claude mcp add wang -- wang mcp`
+    /// Serve wang's tools over MCP (stdin/stdout) to Claude Code, Codex, Cursor, Claude Desktop, or any MCP client
     Mcp,
     /// Small local model (llama.cpp, in the jail) for history summaries at $0
     Local {
@@ -135,6 +135,11 @@ enum Cmd {
     Vm {
         #[command(subcommand)]
         action: VmAction,
+    },
+    /// Voice (hands-free): test speech-to-text and text-to-speech with one cheap call
+    Voice {
+        #[command(subcommand)]
+        action: VoiceAction,
     },
     /// Approve a pending privileged action
     Approve { id: String },
@@ -211,6 +216,15 @@ enum VmAction {
         /// VMs to fork at once
         #[arg(long, default_value_t = 8)]
         clones: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum VoiceAction {
+    /// Speak a sentence, transcribe it back, print both and timings
+    Test {
+        #[arg(default_value = "hello from wang")]
+        text: String,
     },
 }
 
@@ -385,6 +399,20 @@ async fn vm_cmd(cfg: &Config, action: VmAction) -> Result<()> {
     }
 }
 
+async fn voice_cmd(cfg: &Config, action: VoiceAction) -> Result<()> {
+    use wang_daemon::voice::{CloudSpeech, Speech};
+    let speech = CloudSpeech::new(cfg.voice.to_cfg())?;
+    let VoiceAction::Test { text } = action;
+    let started = std::time::Instant::now();
+    let ogg = speech.speak(&text).await.context("text-to-speech failed (is the key right?)")?;
+    let tts_ms = started.elapsed().as_millis() as u64;
+    println!("spoken \"{text}\"  ({} bytes · {} ms)", ogg.len(), tts_ms);
+    let t = speech.transcribe(ogg.clone(), "audio/ogg").await.context("speech-to-text failed (is the key right?)")?;
+    println!("heard  \"{}\"  ({} ms)", t.text, t.ms);
+    println!("round trip {} ms", tts_ms + t.ms);
+    Ok(())
+}
+
 async fn browse(cfg: &Config, urls: &[String], part: usize, stats: bool) -> Result<()> {
     let bcfg = cfg.browser.to_cfg()?;
     let jail = wang_jail::Jail::new()?;
@@ -533,6 +561,11 @@ async fn main() -> Result<()> {
             let cfg = Config::load(&cfg_path)?;
             vm_cmd(&cfg, action).await
         }
+        Cmd::Voice { action } => {
+            config::load_env();
+            let cfg = Config::load(&cfg_path)?;
+            voice_cmd(&cfg, action).await
+        }
         Cmd::Browse { urls, part, stats } => {
             let cfg = Config::load(&cfg_path)?;
             browse(&cfg, &urls, part, stats).await
@@ -655,9 +688,15 @@ async fn bare(cfg_path: &std::path::Path) -> Result<()> {
     if !setup::api_key_set() {
         println!("wang's own agent needs an API key (put OPENROUTER_API_KEY=... in {}).", config::env_path().display());
         if setup::claude_has_wang() {
-            println!("Or use wang from Claude Code: it's plugged in, just open `claude` and ask it to use wang.");
+            println!("Or use wang from Claude Code: it's connected, just open `claude` and ask it to use wang.");
+        } else if setup::codex_has_wang() {
+            println!("Or use wang from Codex: it's connected, just open `codex` and ask it to use wang.");
+        } else if setup::cursor_has_wang() {
+            println!("Or use wang from Cursor: it's connected, open Cursor and ask it to use wang.");
+        } else if setup::claude_desktop_has_wang() {
+            println!("Or use wang from Claude Desktop: it's connected, just ask it to use wang.");
         } else {
-            println!("Or use wang from Claude Code with your Claude login: `wang setup`.");
+            println!("Or connect wang as an MCP server to your agent (Claude Code, Codex, Cursor, Claude Desktop): `wang setup`.");
         }
         return Ok(());
     }

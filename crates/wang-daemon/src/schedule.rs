@@ -24,6 +24,7 @@ use crate::model::ModelClient;
 use crate::notify::{Notice, Notify};
 use crate::server::Hub;
 use crate::telegram::Bot;
+use crate::voice::{Speech, spoken_part};
 
 /// Shortest interval for a repeating task.
 pub const MIN_EVERY: CDuration = CDuration::minutes(10);
@@ -392,6 +393,9 @@ impl Store {
 pub struct Delivery {
     pub bot: Option<Arc<Bot>>,
     pub notifier: Option<Arc<dyn Notify>>,
+    /// Cloud speech, for Telegram chats when `[voice] speak_schedules` is on.
+    pub speech: Option<Arc<dyn Speech>>,
+    pub speak_schedules: bool,
 }
 
 impl Delivery {
@@ -400,6 +404,19 @@ impl Delivery {
         if let (Some(bot), Some(chat)) = (&self.bot, s.session.strip_prefix("tg-").and_then(|c| c.parse::<i64>().ok())) {
             if let Err(e) = bot.send_long(chat, &format!("⏰ {short}\n\n{text}")).await {
                 tracing::warn!(id = s.id, "telegram delivery failed: {e:#}");
+            }
+            if self.speak_schedules && let Some(speech) = &self.speech {
+                let (spoken, _) = spoken_part(text);
+                if !spoken.is_empty() {
+                    match speech.speak(&spoken).await {
+                        Ok(ogg) => {
+                            if let Err(e) = bot.send_voice(chat, ogg, Some(format!("⏰ {short}"))).await {
+                                tracing::warn!(id = s.id, "telegram voice delivery failed: {e:#}");
+                            }
+                        }
+                        Err(e) => tracing::warn!(id = s.id, "voice delivery failed: {e:#}"),
+                    }
+                }
             }
             return;
         }

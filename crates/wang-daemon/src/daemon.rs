@@ -15,6 +15,7 @@ use crate::model::{AnyModel, ModelClient};
 use crate::server::{Channel, Hub, UnixSocketChannel};
 use crate::telegram::{Bot, Telegram, TelegramChannel};
 use crate::tools::{Sandbox, ToolCtx, WebPolicy};
+use crate::voice::{CloudSpeech, Speech};
 use wang_jail::Jail;
 
 /// Start the jail and prove it works; failures leave sandboxed tools disabled (fail closed).
@@ -172,6 +173,23 @@ pub fn telegram_bot(cfg: &Config) -> Result<Option<Arc<Bot>>> {
     }
 }
 
+/// Cloud speech, when `[voice]` is on and its key is set. Used by Telegram and the scheduler.
+pub fn build_speech(cfg: &Config) -> Result<Option<Arc<dyn Speech>>> {
+    let vcfg = cfg.voice.to_cfg();
+    let (state, why) = vcfg.status();
+    match state {
+        "on" => {
+            let speech = Arc::new(CloudSpeech::new(vcfg)?) as Arc<dyn Speech>;
+            tracing::info!("voice on (STT {} · TTS {} · {})", cfg.voice.stt_model, cfg.voice.tts_model, cfg.voice.tts_voice);
+            Ok(Some(speech))
+        }
+        _ => {
+            tracing::info!("voice off ({why})");
+            Ok(None)
+        }
+    }
+}
+
 pub fn build_agent(cfg: &Config, sandbox: Sandbox, tg: Option<&Arc<Bot>>) -> Result<Agent<AnyModel>> {
     let client = AnyModel::from_config_routed(&cfg.model, cfg.routing.cheap())?;
     let db = config::db_path();
@@ -239,6 +257,7 @@ pub fn build_agent(cfg: &Config, sandbox: Sandbox, tg: Option<&Arc<Bot>>) -> Res
 pub async fn run(cfg: &Config) -> Result<()> {
     let sandbox = build_sandbox(cfg).await?;
     let tg = telegram_bot(cfg)?;
+    let speech = build_speech(cfg)?;
     let agent = build_agent(cfg, sandbox, tg.as_ref())?;
     tracing::info!(
         "wang daemon {} · provider {} · model {} · db {}",
@@ -254,7 +273,12 @@ pub async fn run(cfg: &Config) -> Result<()> {
     // Scheduled tasks: results go to the Telegram chat they were made in, else to the alerts.
     let scheduler = {
         let store = hub.agent.ctx.schedules.clone();
-        let delivery = Arc::new(crate::schedule::Delivery { bot: tg.clone(), notifier: hub.agent.notifier.clone() });
+        let delivery = Arc::new(crate::schedule::Delivery {
+            bot: tg.clone(),
+            notifier: hub.agent.notifier.clone(),
+            speech: speech.clone(),
+            speak_schedules: cfg.voice.speak_schedules,
+        });
         let hub = hub.clone();
         async move {
             match store {
@@ -272,7 +296,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
         match tg {
             Some(bot) => {
                 let via_notifier = cfg.telegram.alerts && !cfg.telegram.allowed_user_ids.is_empty();
-                TelegramChannel::new(bot, &cfg.telegram, via_notifier).serve(hub.clone()).await
+                TelegramChannel::new(bot, &cfg.telegram, via_notifier, speech.clone(), cfg.voice.max_seconds).serve(hub.clone()).await
             }
             None => {
                 tracing::info!("telegram off (set TELEGRAM_BOT_TOKEN in .env to enable)");
