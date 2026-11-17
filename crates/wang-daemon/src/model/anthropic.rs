@@ -73,6 +73,10 @@ impl Anthropic {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
+        if !cfg.cache_hints {
+            body.as_object_mut().unwrap().remove("cache_control");
+            body["system"] = json!([{"type": "text", "text": system}]);
+        }
         if cfg.fallbacks && supports_fallbacks(model) {
             body["fallbacks"] = json!("default");
         }
@@ -169,6 +173,10 @@ mod tests {
         assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(b["cache_control"]["type"], "ephemeral");
         assert_eq!(b["thinking"]["type"], "adaptive");
+        let off = ModelCfg { cache_hints: false, ..cfg.clone() };
+        let nb = Anthropic::build_body(&off.model_id(), &off, "sys", &tools, &msgs);
+        assert!(nb.get("cache_control").is_none() && nb["system"][0].get("cache_control").is_none());
+        assert_eq!(nb["system"][0]["text"], "sys");
         assert_eq!(b["output_config"]["effort"], "medium");
         assert_eq!(b["fallbacks"], "default");
         assert!(b.get("temperature").is_none());

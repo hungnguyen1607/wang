@@ -21,12 +21,53 @@ use crate::notify::{Notice, Notify};
 use crate::protocol::ServerMsg;
 use crate::tools::{self, ToolCtx};
 
-/// Static system prompt. Nothing per-request (no dates, no ids): it is the cached prefix.
-pub const SYSTEM_PROMPT: &str = "\
-You are wang, a personal assistant running as a daemon on the user's own Linux laptop. \
-The user talks to you from a terminal (and later from their phone). \
-You can act on the laptop with three tools: read_file, shell and web_fetch.
+/// Who the assistant is and how it talks (`[persona]`). Only the voice changes; the rules don't.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Persona {
+    pub name: String,
+    pub user_name: String,
+    pub style: String,
+    pub spoken_style: String,
+}
 
+impl Default for Persona {
+    fn default() -> Self {
+        Self { name: "wang".into(), user_name: String::new(), style: String::new(), spoken_style: String::new() }
+    }
+}
+
+/// Added to a message whose reply will be read aloud, unless `[persona] spoken_style` says otherwise.
+pub const DEFAULT_SPOKEN_STYLE: &str = "Your reply will be read aloud. Answer in one to three short spoken sentences: \
+no Markdown, lists, tables, code blocks or URLs unless the user asks for them. Say numbers and times the way a person would.";
+
+impl Persona {
+    /// Guidance for a reply from this source (voice replies get spoken style), if any.
+    pub fn reply_guidance(&self, source: &str) -> Option<&str> {
+        (source == "voice").then(|| if self.spoken_style.is_empty() { DEFAULT_SPOKEN_STYLE } else { self.spoken_style.as_str() })
+    }
+}
+
+/// The system prompt for a persona. Nothing per-request (no dates, no ids): it is the cached prefix,
+/// built once per agent.
+pub fn system_prompt(p: &Persona) -> String {
+    let mut s = format!(
+        "You are {}, a personal assistant running as a daemon on the user's own Linux laptop. \
+The user talks to you from a terminal, from their phone (Telegram) or by voice. \
+You act on the laptop with the tools you're given; everything they run is sandboxed.\n",
+        p.name
+    );
+    if !p.user_name.is_empty() {
+        s += &format!("The user's name is {}.\n", p.user_name);
+    }
+    if !p.style.is_empty() {
+        s += &format!("Personality and tone: {}. This shapes how you speak, never what you're allowed to do: the rules below always win.\n", p.style.trim_end_matches('.'));
+    }
+    s += "\n";
+    s += SYSTEM_RULES;
+    s
+}
+
+pub const SYSTEM_RULES: &str = "\
 How to work:
 - Do the task, don't describe how you would do it. Use tools when they are needed and skip them when you already know the answer.
 - Be economical: every tool output is sent back to the model and costs money. Prefer targeted commands \
@@ -116,6 +157,9 @@ pub struct Limits {
     pub compact_at_tokens: u64,
     /// User turns kept verbatim after compaction.
     pub compact_keep_turns: usize,
+    /// Replace a repeated call's byte-identical output with a pointer to the earlier one.
+    /// Off only for the eval baseline ("plain" arm).
+    pub dedupe: bool,
 }
 
 impl Default for Limits {
@@ -128,6 +172,7 @@ impl Default for Limits {
             budget_usd: 0.0,
             compact_at_tokens: 0,
             compact_keep_turns: 2,
+            dedupe: true,
         }
     }
 }
@@ -150,6 +195,9 @@ pub struct Agent<C> {
     /// Multi-agent orchestration settings (M11).
     pub orchestration: crate::orchestrate::OrchestrationCfg,
     tools: Vec<Value>,
+    /// System prompt (from the persona), fixed for the agent's lifetime.
+    system: String,
+    pub persona: Persona,
 }
 
 /// How often one exact call (tool + input) has been made / has failed in this task.
@@ -193,7 +241,15 @@ pub(crate) fn text_of(content: &[Value]) -> String {
 impl<C: ModelClient> Agent<C> {
     pub fn new(client: C, ledger: Arc<Ledger>, tracer: Arc<Tracer>, ctx: ToolCtx, limits: Limits) -> Self {
         let tools = tools::definitions_for(&ctx);
-        Self { client, ledger, tracer, ctx, limits, notifier: None, approvals: None, summarizer: None, orchestration: Default::default(), tools }
+        let persona = Persona::default();
+        let system = system_prompt(&persona);
+        Self { client, ledger, tracer, ctx, limits, notifier: None, approvals: None, summarizer: None, orchestration: Default::default(), tools, system, persona }
+    }
+
+    pub fn with_persona(mut self, p: Persona) -> Self {
+        self.system = system_prompt(&p);
+        self.persona = p;
+        self
     }
 
     pub fn with_orchestration(mut self, o: crate::orchestrate::OrchestrationCfg) -> Self {
@@ -407,6 +463,9 @@ impl<C: ModelClient> Agent<C> {
         if !guidance.is_empty() {
             user_text += &format!("\n\n[wang workflow: {}] {guidance}", wf.name());
         }
+        if let Some(g) = self.persona.reply_guidance(source) {
+            user_text += &format!("\n\n[spoken reply] {g}");
+        }
         conv.push_user_text(&user_text);
 
         let mut usage = Usage::default();
@@ -449,7 +508,7 @@ impl<C: ModelClient> Agent<C> {
                 );
                 let started = Instant::now();
                 let ctx = CallCtx { session: &conv.id, on_text: &on_text, step: calls + 1 };
-                let resp = match self.client.create(SYSTEM_PROMPT, &self.tools, &conv.messages, &ctx).await {
+                let resp = match self.client.create(&self.system, &self.tools, &conv.messages, &ctx).await {
                     Ok(r) => r,
                     Err(e) => {
                         let msg = format!("{e:#}");
@@ -544,7 +603,7 @@ impl<C: ModelClient> Agent<C> {
                         c.calls += 1;
                         c.name = tu["name"].as_str().unwrap_or_default().to_string();
                         c.detail = tools::detail(&c.name, &tu["input"]);
-                        (c.calls > 1, c.last_output.clone())
+                        (c.calls > 1, if self.limits.dedupe { c.last_output.clone() } else { None })
                     })
                     .collect();
                 let session = conv.id.clone();
@@ -672,12 +731,23 @@ impl<C: ModelClient> Agent<C> {
             let block = json!({"type": "tool_result", "tool_use_id": id, "content": why, "is_error": true});
             return ToolOutcome { block, is_error: true, error: why, output_hash: 0, id };
         }
-        // Approval gate.
-        if let (Some(appr), true) = (&self.approvals, self.ctx.needs_approval(name, &input)) {
+        // Approval gate: privileged shell commands, and browser actions that would act as the
+        // user on a site where wang is signed in with their logins.
+        let reason = self.ctx.approval_reason(name, &input, session).await;
+        if let (Some(why), None, "browser") = (&reason, &self.approvals, name) {
+            let why = format!("Not done: {why}, and there's no way to ask the user for approval here. Tell them what you wanted to do instead.");
+            self.end(span, Status::Error, json!({"error.type": "guardrail", "error.message": why}));
+            events(ServerMsg::ToolEnd { name: name.to_string(), ok: false, ms: 0, trimmed: false, repeated });
+            let _ = self.ledger.record_tool(task_id, &ToolRecord { name, detail: &detail, is_error: true, error: Some(&why), repeated, ..Default::default() });
+            let block = json!({"type": "tool_result", "tool_use_id": id, "content": why, "is_error": true});
+            return ToolOutcome { block, is_error: true, error: why, output_hash: 0, id };
+        }
+        if let (Some(appr), Some(why)) = (&self.approvals, &reason) {
+            let shown = if name == "browser" { format!("{detail} — {why}") } else { detail.clone() };
             let (aid, rx) = appr.open();
-            events(ServerMsg::ApprovalRequest { id: aid.clone(), tool: name.to_string(), detail: detail.clone() });
+            events(ServerMsg::ApprovalRequest { id: aid.clone(), tool: name.to_string(), detail: shown.clone() });
             let aspan = self.span(task_id, span, Kind::Approval, "approval", json!({"wang.approval.id": aid, "gen_ai.tool.name": name}));
-            appr.notify(&aid, task_id, &format!("{name}: {detail}")).await;
+            appr.notify(&aid, task_id, &format!("{name}: {shown}")).await;
             let (decision, waited) = appr.wait(&aid, rx).await;
             self.end(
                 aspan,
@@ -948,6 +1018,48 @@ pub(crate) mod tests {
         assert_eq!(second, "[output identical to the earlier identical call a; not repeated to save tokens]");
         let spans = a.tracer.spans(r.task_id).unwrap();
         assert_eq!(spans.iter().filter(|s| s.attrs.get("wang.tool.deduped") == Some(&json!(true))).count(), 1);
+    }
+
+    #[test]
+    fn persona_shapes_prompt_not_rules() {
+        let plain = system_prompt(&Persona::default());
+        assert!(plain.starts_with("You are wang,") && plain.ends_with(SYSTEM_RULES));
+        assert!(!plain.contains("Personality") && !plain.contains("three tools"));
+        let p = Persona { name: "Jarvis".into(), user_name: "Hung".into(), style: "dry wit, calls me sir.".into(), ..Default::default() };
+        let s = system_prompt(&p);
+        assert!(s.starts_with("You are Jarvis,") && s.contains("The user's name is Hung.") && s.contains("calls me sir. This shapes"), "{s}");
+        assert!(s.ends_with(SYSTEM_RULES));
+        assert_eq!(p.reply_guidance("telegram"), None);
+        assert_eq!(p.reply_guidance("voice"), Some(DEFAULT_SPOKEN_STYLE));
+        let custom = Persona { spoken_style: "one sentence".into(), ..Default::default() };
+        assert_eq!(custom.reply_guidance("voice"), Some("one sentence"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn voice_messages_get_spoken_guidance() {
+        let a = agent(Mock::new(vec![resp(json!([{"type": "text", "text": "Sure."}]), "end_turn", 0)]))
+            .with_persona(Persona { name: "Jarvis".into(), ..Default::default() });
+        let mut conv = Conversation::new("s");
+        a.run_turn(&mut conv, "voice", "/general what time is it", &|_| {}).await.unwrap();
+        let sent = conv.messages[0]["content"][0]["text"].as_str().unwrap();
+        assert!(sent.contains("[spoken reply] Your reply will be read aloud"), "{sent}");
+        let sys = a.client.systems.lock().unwrap()[0].clone();
+        assert!(sys.starts_with("You are Jarvis,"), "{sys}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dedupe_off_sends_full_output() {
+        let mut script = vec![tu("a", "seq 1 300"), tu("b", "seq 1 300")];
+        script.push(resp(json!([{"type": "text", "text": "ok"}]), "end_turn", 0));
+        let mut a = agent(Mock::new(script));
+        a.limits.dedupe = false;
+        let mut conv = Conversation::new("s");
+        let r = a.run_turn(&mut conv, "test", "x", &|_| {}).await.unwrap();
+        assert_eq!(r.outcome, "done");
+        let first = conv.messages[2]["content"][0]["content"].as_str().unwrap();
+        let second = conv.messages[4]["content"][0]["content"].as_str().unwrap();
+        assert_eq!(first, second);
+        assert!(second.contains("exit code: 0"));
     }
 
     #[tokio::test(flavor = "current_thread")]

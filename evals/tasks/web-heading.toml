@@ -1,0 +1,4 @@
+id = "web-heading"
+prompt = "What's the main heading on https://example.com?"
+[check]
+reply_contains = ["Example Domain"]

@@ -1,0 +1,15 @@
+id = "todo-to-json"
+prompt = "Convert the open (unchecked) items in todo.md into todo.json: a JSON array of strings, in file order."
+[files]
+"todo.md" = '''
+# Week
+- [ ] email landlord
+- [x] pay rent
+- [ ] fix sink
+
+## Later
+- [ ] renew passport
+- [x] call mum
+'''
+[check]
+command = "python3 -I -c \"import json; assert json.load(open('todo.json')) == ['email landlord', 'fix sink', 'renew passport']\""

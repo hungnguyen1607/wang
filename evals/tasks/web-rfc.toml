@@ -1,0 +1,4 @@
+id = "web-rfc"
+prompt = "According to https://www.iana.org/help/example-domains, which RFC reserves the example domains? Give the RFC number."
+[check]
+reply_contains = ["2606"]

@@ -88,13 +88,20 @@ impl McpServer {
         if !tools::definitions_for(&self.ctx).iter().any(|d| d["name"] == name) {
             return (format!("unknown tool: {name}"), true);
         }
-        if self.ctx.needs_approval(name, args) && !self.allow_privileged {
-            return (
+        if !self.allow_privileged
+            && let Some(why) = self.ctx.approval_reason(name, args, &self.session).await
+        {
+            let msg = if name == "browser" {
+                format!(
+                    "Not done: {why}. wang's MCP server doesn't act as the user on signed-in sites unless [mcp] allow_privileged = true \
+                     (then Claude's own permission prompt is the check). Tell the user what you wanted to do."
+                )
+            } else {
                 "This command needs write or network access, which wang's MCP server doesn't allow. Run it in the vm tool instead, \
                  or ask the user to set [mcp] allow_privileged = true in ~/.config/wang/config.toml."
-                    .into(),
-                true,
-            );
+                    .into()
+            };
+            return (msg, true);
         }
         let out = tools::run_in(name, args, &self.ctx, &self.session).await;
         (cap_middle(&out.text, self.output_cap).text, out.is_error)

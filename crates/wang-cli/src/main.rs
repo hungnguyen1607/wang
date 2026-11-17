@@ -15,7 +15,12 @@ use wang_tokens::Ledger;
 use wang_trace::Tracer;
 
 #[derive(Parser)]
-#[command(name = "wang", version, about = "Secure, lightweight, token-cheap laptop agent")]
+#[command(
+    name = "wang",
+    version,
+    about = "Secure, lightweight, token-cheap laptop agent",
+    after_help = "Just say what you want:  wang \"clean up my Downloads folder\"  (quote it if it starts with a command name)"
+)]
 struct Cli {
     /// Config file (default: ~/.config/wang/config.toml)
     #[arg(long, global = true)]
@@ -29,6 +34,9 @@ struct Cli {
 enum Cmd {
     /// Guided first run: checks, Claude Code hookup, API key, background service (asks before each)
     Setup,
+    /// Anything that isn't a command is a task: `wang fix the typo in notes.txt`
+    #[command(external_subcommand)]
+    Task(Vec<String>),
     /// What works on this machine and how to fix what doesn't (changes nothing)
     Doctor,
     /// Create ~/.config/wang/config.toml and ~/.config/wang/.env
@@ -80,6 +88,18 @@ enum Cmd {
         /// Run only this task id
         #[arg(long)]
         only: Option<String>,
+        /// Harness arms to compare: wang (as shipped), plain (no harness optimizations), plan (forced orchestration)
+        #[arg(long, value_delimiter = ',', default_value = "wang")]
+        arms: Vec<wang_evals::Arm>,
+        /// Runs per task and arm (live models vary run to run)
+        #[arg(long, default_value_t = 1)]
+        trials: u32,
+        /// Live: stop starting runs once this many USD are spent
+        #[arg(long)]
+        max_usd: Option<f64>,
+        /// Print a saved run's report (a folder under evals/runs) instead of running
+        #[arg(long)]
+        show: Option<PathBuf>,
         /// Suite folder (default ./evals)
         #[arg(long, default_value = "evals")]
         dir: PathBuf,
@@ -118,6 +138,11 @@ enum Cmd {
         /// Print a size/time/memory table instead of the pages
         #[arg(long)]
         stats: bool,
+    },
+    /// Sign in to your sites in a visible window, once; wang's browser stays signed in after that: `wang login youtube.com instagram.com`
+    Login {
+        /// Sites to open for signing in (you can open more in the window)
+        sites: Vec<String>,
     },
     /// Tasks wang does on a schedule: `wang schedule add "every weekday at 8am" summarize hacker news`
     Schedule {
@@ -458,6 +483,7 @@ async fn main() -> Result<()> {
         return bare(&cfg_path).await;
     };
     match cmd {
+        Cmd::Task(words) => task(&cfg_path, words.join(" ")).await,
         Cmd::Setup => setup::setup(&cfg_path).await,
         Cmd::Doctor => {
             config::load_env();
@@ -533,6 +559,10 @@ async fn main() -> Result<()> {
             let cfg = Config::load(&cfg_path)?;
             vm_cmd(&cfg, action).await
         }
+        Cmd::Login { sites } => {
+            let cfg = Config::load(&cfg_path)?;
+            login(&cfg, &sites).await
+        }
         Cmd::Browse { urls, part, stats } => {
             let cfg = Config::load(&cfg_path)?;
             browse(&cfg, &urls, part, stats).await
@@ -567,12 +597,17 @@ async fn main() -> Result<()> {
             println!("task #{id} rated {}", if matches!(verdict, Verdict::Good) { "👍" } else { "👎" });
         }),
         Cmd::Service { action: ServiceAction::Install } => service_install(),
-        Cmd::Eval { live, routing, only, dir } => {
+        Cmd::Eval { live, routing, only, arms, trials, max_usd, show, dir } => {
+            if let Some(run) = show {
+                print!("{}", wang_evals::Report::load(&run.join("report.json"))?);
+                return Ok(());
+            }
             config::load_env();
             let cfg = Config::load(&cfg_path)?;
             let cheap = routing.then(|| cfg.routing.cheap_model.clone());
             let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-            let out = dir.join("runs").join(format!("{stamp}-{}{}", if live { "live" } else { "replay" }, if routing { "-routed" } else { "" }));
+            let arm_tag = if arms == [wang_evals::Arm::Wang] { String::new() } else { format!("-{}", arms.iter().map(|a| a.name()).collect::<Vec<_>>().join("+")) };
+            let out = dir.join("runs").join(format!("{stamp}-{}{}{arm_tag}", if live { "live" } else { "replay" }, if routing { "-routed" } else { "" }));
             let opts = wang_evals::RunOpts {
                 mode: if live { wang_evals::Mode::Live } else { wang_evals::Mode::Replay },
                 suite: dir.join("tasks"),
@@ -580,6 +615,9 @@ async fn main() -> Result<()> {
                 out: out.clone(),
                 routing: cheap,
                 only,
+                arms,
+                trials,
+                max_usd,
             };
             let report = wang_evals::run(cfg, &opts).await?;
             print!("{report}");
@@ -663,6 +701,50 @@ async fn bare(cfg_path: &std::path::Path) -> Result<()> {
     }
     setup::ensure_daemon().await?;
     chat(String::new(), "cli".into(), false).await
+}
+
+async fn login(cfg: &Config, sites: &[String]) -> Result<()> {
+    use wang_browser::logins::LoginSource;
+    let Some(logins) = cfg.browser.logins_cfg().filter(|l| matches!(l.source, LoginSource::Jar(_))) else {
+        bail!(
+            "wang's browser isn't set to keep its own logins. Add this under [browser] in ~/.config/wang/config.toml:\n  logins = \"wang\"\n  login_sites = [\"*\"]"
+        );
+    };
+    println!("Opening a browser window. Sign in to whatever you want wang to use, in as many tabs as you like.");
+    println!("When you're done, come back here and press Enter (or just close the window).");
+    let done = async {
+        let mut line = String::new();
+        let _ = tokio::io::BufReader::new(tokio::io::stdin()).read_line(&mut line).await;
+    };
+    let _ = logins;
+    let bcfg = cfg.browser.to_cfg()?;
+    let jail = wang_jail::Jail::new()?;
+    jail.check().await?;
+    let r = wang_browser::login::login_window(&jail, &bcfg, sites, done).await?;
+    if r.sites.is_empty() {
+        println!("Saved. ({} cookies in wang's login file; no new sites this time.)", r.saved);
+    } else {
+        println!("Saved. wang's browser is now signed in on: {}", r.sites.join(", "));
+    }
+    println!(
+        "Actions that could act as you there (send, post, buy, delete, buttons) will ask you first.\n\
+         New browsers start with these logins; one wang already has open picks them up after it closes (idle timeout)."
+    );
+    Ok(())
+}
+
+/// `wang <task>`: one-shot, starting the daemon if needed.
+async fn task(cfg_path: &std::path::Path, text: String) -> Result<()> {
+    config::load_env();
+    if !setup::api_key_set() {
+        bail!(
+            "wang's own agent needs an API key: put OPENROUTER_API_KEY=... in {} (or use wang from Claude Code via `wang mcp`). Config: {}",
+            config::env_path().display(),
+            cfg_path.display()
+        );
+    }
+    setup::ensure_daemon().await?;
+    chat(text, "cli".into(), false).await
 }
 
 fn init(cfg_path: &std::path::Path) -> Result<()> {
@@ -778,7 +860,7 @@ async fn send_approval(id: &str, allow: bool) -> Result<()> {
 /// Send one message and stream events until Done/Error. Returns the task id.
 /// Approval requests are answered from the terminal (y/N) or from the phone, whichever comes first.
 async fn run_message(c: &mut Client, p: &mut Printer, lines: &mut StdinLines, session: &str, text: &str) -> Result<Option<i64>> {
-    c.send(&ClientMsg::Message { session: session.into(), text: text.into() }).await?;
+    c.send(&ClientMsg::Message { session: session.into(), text: text.into(), voice: false }).await?;
     let interactive = std::io::stdin().is_terminal();
     let mut pending: Option<String> = None;
     loop {

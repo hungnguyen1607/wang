@@ -1,0 +1,11 @@
+id = "wrong-path"
+prompt = "Read config/settings.ini and tell me the timeout value."
+max_steps = 12
+[files]
+"conf/settings.ini" = '''
+[net]
+timeout = 45
+retries = 3
+'''
+[check]
+reply_contains = ["45"]

@@ -1,0 +1,12 @@
+id = "sum-durations"
+prompt = "durations.txt lists activities with durations in mixed units (s, min, h). What's the total in minutes?"
+[files]
+"durations.txt" = '''
+warmup 90s
+run 1.5h
+stretch 12min
+cooldown 300s
+walk 0.25h
+'''
+[check]
+reply_contains = ["123.5"]

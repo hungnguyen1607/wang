@@ -1,0 +1,5 @@
+id = "csv-big-sum"
+prompt = "What is the total amount for the travel category in ledger.csv? Give it to 2 decimal places."
+setup = "awk 'BEGIN{print \"id,category,amount\"; split(\"travel,food,rent,fun,tools\",c,\",\"); for(i=1;i<=20000;i++) printf \"%d,%s,%d.%02d\\n\", i, c[((i/613)%10<4?2:(i/613)%10)+1], (i*37)%200, (i*13)%100 }' > ledger.csv"
+[check]
+reply_contains = ["0.00"]

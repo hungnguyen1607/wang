@@ -1,0 +1,21 @@
+id = "rename-function"
+prompt = "Rename the function getdata to get_data everywhere in this project, keeping main.py working."
+[files]
+"lib/data.py" = '''
+def getdata():
+    return [1, 2, 3]
+'''
+"lib/__init__.py" = ""
+"report.py" = '''
+from lib.data import getdata
+
+def report():
+    return sum(getdata())
+'''
+"main.py" = '''
+from report import report
+from lib.data import getdata
+print(report(), len(getdata()))
+'''
+[check]
+command = "! grep -rq 'getdata' --include=*.py . && test \"$(python3 -c 'import sys; sys.path.insert(0, \".\"); exec(open(\"main.py\").read())')\" = '6 3'"

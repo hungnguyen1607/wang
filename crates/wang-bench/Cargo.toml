@@ -17,3 +17,6 @@ tokio.workspace = true
 futures.workspace = true
 chrono.workspace = true
 rusqlite.workspace = true
+
+[dev-dependencies]
+wang-evals = { path = "../wang-evals" }

@@ -1,0 +1,17 @@
+id = "fix-python-bug"
+prompt = "test_calc.py fails. Fix the bug in calc.py (not the test) so `python3 test_calc.py` passes."
+[files]
+"calc.py" = '''
+def average(xs):
+    if not xs:
+        return 0
+    return sum(xs) / (len(xs) + 1)
+'''
+"test_calc.py" = '''
+from calc import average
+assert average([2, 4, 6]) == 4
+assert average([]) == 0
+print('ok')
+'''
+[check]
+command = "python3 test_calc.py && grep -q 'average(\\[2, 4, 6\\]) == 4' test_calc.py"

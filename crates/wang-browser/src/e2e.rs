@@ -208,3 +208,71 @@ async fn pool_caps_reuses_and_evicts() {
     drop(_c);
     pool.shutdown().await;
 }
+
+/// Borrowed logins reach the page as real cookies, and the guardrail separates reading from acting.
+#[tokio::test(flavor = "current_thread")]
+async fn borrowed_logins_and_guardrail() {
+    let Some(jail) = jail() else { return };
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let _srv = tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else { return };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let cookie = req.lines().find_map(|l| l.strip_prefix("Cookie: ").or_else(|| l.strip_prefix("cookie: "))).unwrap_or("none").to_string();
+                let body = format!(
+                    "<!doctype html><title>Inbox</title><h1>Hello cookie={cookie}</h1>\
+                     <a href=\"/profile\">My profile</a> <button>Show more</button> <button>Send</button>\
+                     <form role=\"search\"><input type=\"search\" name=\"q\" placeholder=\"Search\"></form>\
+                     <textarea aria-label=\"Message\"></textarea>"
+                );
+                let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    // A fake Firefox profile with one login for this site and one for another.
+    let profile = std::env::temp_dir().join(format!("wang-ff-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&profile).unwrap();
+    let db = rusqlite::Connection::open(profile.join("cookies.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE moz_cookies (id INTEGER PRIMARY KEY, originAttributes TEXT NOT NULL DEFAULT '', name TEXT, value TEXT, host TEXT, path TEXT,
+         expiry INTEGER, isSecure INTEGER, isHttpOnly INTEGER, sameSite INTEGER DEFAULT 0);
+         INSERT INTO moz_cookies (name, value, host, path, expiry, isSecure, isHttpOnly) VALUES
+           ('sid', 'session42', '127.0.0.1', '/', 4000000000, 0, 1),
+           ('other', 'nope', '.elsewhere.com', '/', 4000000000, 1, 1);",
+    )
+    .unwrap();
+    drop(db);
+
+    let logins = logins::LoginsCfg { source: logins::LoginSource::Firefox(profile.clone()), sites: vec!["127.0.0.1".into()] };
+    let cfg = BrowserCfg { domains: vec![format!("127.0.0.1:{port}")], logins: Some(logins), ..Default::default() };
+    let mut b = Browser::launch(&jail, &cfg).await.unwrap();
+    assert_eq!(b.logins_error, None);
+    assert_eq!(b.signed_in_hosts(), ["127.0.0.1"]);
+
+    b.open(&format!("http://127.0.0.1:{port}/")).await.unwrap();
+    let t = b.view(cfg.view_chars).await.unwrap().text;
+    assert!(t.contains("Hello cookie=sid=session42"), "borrowed login not sent:\n{t}");
+    assert!(!t.contains("nope"), "another site's cookie leaked:\n{t}");
+
+    let refnum = |needle: &str| -> usize {
+        let i = t.find(needle).unwrap_or_else(|| panic!("{needle} not in view:\n{t}"));
+        let open = t[..i].rfind('[').unwrap();
+        t[open + 1..].split(' ').next().unwrap().parse().unwrap()
+    };
+    assert_eq!(b.guard("click", Some(refnum("My profile")), false, None).await, None, "links are free");
+    assert_eq!(b.guard("click", Some(refnum("Show more")), false, None).await, None);
+    let send = b.guard("click", Some(refnum("Send")), false, None).await.expect("Send needs approval");
+    assert!(send.contains("\"Send\"") && send.contains("signed in as you"), "{send}");
+    assert_eq!(b.guard("type", Some(refnum("input search")), true, None).await, None, "searching is free");
+    assert!(b.guard("type", Some(refnum("Message")), true, None).await.is_some(), "Enter in a message box needs approval");
+    assert!(b.guard("open", None, false, Some(&format!("http://127.0.0.1:{port}/logout"))).await.is_some());
+    assert_eq!(b.guard("open", None, false, Some("https://example.com/delete")).await, None, "not a signed-in site");
+    b.close().await;
+    std::fs::remove_dir_all(profile).ok();
+}

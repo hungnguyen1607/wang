@@ -1,0 +1,10 @@
+id = "largest-dir"
+prompt = "Which subfolder of data/ holds the most bytes in total? Just name it."
+setup = '''
+for d in alpha beta gamma delta; do mkdir -p data/$d; done
+for i in $(seq 1 40); do head -c $((i*100)) /dev/zero > data/alpha/f$i.bin; done
+for i in $(seq 1 10); do head -c $((i*900)) /dev/zero > data/beta/f$i.bin; done
+for i in $(seq 1 60); do head -c $((i*40)) /dev/zero > data/gamma/f$i.bin; done
+for i in $(seq 1 5); do head -c 15000 /dev/zero > data/delta/f$i.bin; done'''
+[check]
+reply_contains = ["alpha"]

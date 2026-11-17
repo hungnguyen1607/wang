@@ -143,7 +143,7 @@ async fn handle_conn<C: ModelClient>(stream: UnixStream, hub: Arc<Hub<C>>) -> Re
                 let reply = if ok { ServerMsg::Ok } else { ServerMsg::Error { message: format!("no pending approval {id}") } };
                 send(&mut w, &reply).await?;
             }
-            ClientMsg::Message { session, text } => {
+            ClientMsg::Message { session, text, voice } => {
                 let conv = hub.session(&session).await;
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerMsg>();
                 let hub2 = hub.clone();
@@ -152,7 +152,7 @@ async fn handle_conn<C: ModelClient>(stream: UnixStream, hub: Arc<Hub<C>>) -> Re
                     let emit = |ev: ServerMsg| {
                         let _ = tx.send(ev);
                     };
-                    hub2.agent.run_turn(&mut conv, "cli", &text, &emit).await
+                    hub2.agent.run_turn(&mut conv, if voice { "voice" } else { "cli" }, &text, &emit).await
                     // tx dropped here, which ends the forwarding loop below
                 };
                 let forward = async {
@@ -225,7 +225,7 @@ mod tests {
         assert_eq!(mode, 0o600);
 
         let mut c = Client::connect(&path).await.unwrap();
-        c.send(&ClientMsg::Message { session: "t".into(), text: "say hi".into() }).await.unwrap();
+        c.send(&ClientMsg::Message { session: "t".into(), text: "say hi".into(), voice: false }).await.unwrap();
         let mut got = vec![];
         loop {
             let m = c.recv().await.unwrap();

@@ -7,7 +7,13 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
     /// Run one task in the named session (conversation).
-    Message { session: String, text: String },
+    Message {
+        session: String,
+        text: String,
+        /// The reply will be read aloud (`wang listen`): ask for short spoken sentences.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        voice: bool,
+    },
     /// Drop the session's history.
     New { session: String },
     /// Answer a pending approval request.

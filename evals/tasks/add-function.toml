@@ -1,0 +1,21 @@
+id = "add-function"
+prompt = "Add a function is_palindrome(s) to strings.py that ignores case, spaces and punctuation, then make sure test_strings.py passes."
+[files]
+"strings_util_readme.txt" = '''
+strings.py holds small text helpers.
+'''
+"strings.py" = '''
+def shout(s):
+    return s.upper() + '!'
+'''
+"test_strings.py" = '''
+import sys; sys.path.insert(0, '.')
+from strings import shout, is_palindrome
+assert shout('hi') == 'HI!'
+assert is_palindrome('A man, a plan, a canal: Panama')
+assert is_palindrome('')
+assert not is_palindrome('wang')
+print('ok')
+'''
+[check]
+command = "python3 -I -c \"import sys; sys.path.insert(0, '.'); exec(open('test_strings.py').read())\""

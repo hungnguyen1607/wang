@@ -1,0 +1,22 @@
+id = "join-top3"
+prompt = "Join people.csv with scores.csv by id (a person's score is the sum of their rows), then write top3.txt with the top 3 names, one per line, highest first. Ties: alphabetical."
+[files]
+"people.csv" = '''
+id,name
+1,Ana
+2,Bo
+3,Cy
+4,Di
+5,Ed
+'''
+"scores.csv" = '''
+id,score
+1,71
+2,88
+3,64
+4,93
+5,88
+2,5
+'''
+[check]
+command = "test \"$(cat top3.txt | sed 's/[[:space:]]*$//')\" = \"$(printf 'Bo\\nDi\\nEd')\""

@@ -1,0 +1,9 @@
+[package]
+name = "wang-voice"
+description = "Voice for wang: end-of-speech detection, wake word, spoken-sentence streaming, pinned STT/TTS assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true

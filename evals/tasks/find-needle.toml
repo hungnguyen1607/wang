@@ -1,0 +1,7 @@
+id = "find-needle"
+prompt = "One of the files in notes/ mentions a launch code. Which file is it, and what's the code?"
+setup = '''
+mkdir -p notes; for i in $(seq 1 300); do printf 'note %d\nnothing to see here, just filler text number %d\n' $i $i > notes/n$i.txt; done
+printf 'meeting notes\nlaunch code: ZEBRA-42\n' > notes/n217.txt'''
+[check]
+reply_contains = ["n217", "ZEBRA-42"]

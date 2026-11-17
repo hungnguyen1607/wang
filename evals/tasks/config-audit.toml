@@ -1,0 +1,27 @@
+id = "config-audit"
+prompt = "Some service configs under conf/ have debug turned on. Write audit.txt listing the file paths (relative, like conf/x.ini) with debug enabled, sorted, one per line."
+[files]
+"conf/api.ini" = '''
+[main]
+debug = true
+port = 80
+'''
+"conf/db.ini" = '''
+[main]
+debug = false
+'''
+"conf/cache/redis.ini" = '''
+[main]
+DEBUG=True
+'''
+"conf/worker.ini" = '''
+[main]
+# debug = true (disabled)
+debug = false
+'''
+"conf/web.ini" = '''
+[main]
+debug=1
+'''
+[check]
+command = "test \"$(cat audit.txt | sed 's/[[:space:]]*$//' | sed '/^$/d')\" = \"$(printf 'conf/api.ini\\nconf/cache/redis.ini\\nconf/web.ini')\""

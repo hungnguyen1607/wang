@@ -1,0 +1,5 @@
+id = "log-errors"
+prompt = "How many ERROR lines are in app.log, and which error code (like E3) appears most often?"
+setup = "awk 'BEGIN{for(i=1;i<=50000;i++){ if(i%613==0) printf \"2026-11-%02d 12:00:%02d ERROR E%d request failed\\n\",(i%28)+1,i%60,((i/613)%10<4?2:(i/613)%10); else printf \"2026-11-%02d 12:00:%02d INFO ok id=%d\\n\",(i%28)+1,i%60,i }}' > app.log"
+[check]
+reply_contains = ["81", "E2"]

@@ -12,6 +12,9 @@
 
 pub mod browser;
 pub mod cdp;
+pub mod guard;
+pub mod login;
+pub mod logins;
 pub mod pool;
 
 use std::path::PathBuf;
@@ -39,6 +42,8 @@ pub struct BrowserCfg {
     /// Characters per view part (~4 per token).
     pub view_chars: usize,
     pub extra_args: Vec<String>,
+    /// Borrow the user's Firefox logins for these sites (None = the browser starts signed out).
+    pub logins: Option<logins::LoginsCfg>,
 }
 
 impl Default for BrowserCfg {
@@ -54,6 +59,7 @@ impl Default for BrowserCfg {
             nav_timeout: Duration::from_secs(30),
             view_chars: 12_000,
             extra_args: vec![],
+            logins: None,
         }
     }
 }

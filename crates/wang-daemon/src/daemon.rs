@@ -191,6 +191,7 @@ pub fn build_agent(cfg: &Config, sandbox: Sandbox, tg: Option<&Arc<Bot>>) -> Res
         budget_usd: a.budget_usd.max(0.0),
         compact_at_tokens: a.compact_at_tokens,
         compact_keep_turns: a.compact_keep_turns.max(1),
+        ..Default::default()
     };
     let notifier = Ntfy::from_config(&cfg.ntfy)?;
     match &notifier {
@@ -233,7 +234,7 @@ pub fn build_agent(cfg: &Config, sandbox: Sandbox, tg: Option<&Arc<Bot>>) -> Res
     let schedules = Arc::new(crate::schedule::Store::open(&db)?);
     let ctx = tool_ctx(cfg, sandbox, workdir, web, memory)?.with_schedules(Some(schedules));
     let summarizer = local_model(cfg, ctx.sandbox.as_ref())?;
-    Ok(Agent::new(client, ledger, tracer, ctx, limits).with_notifier(notifier).with_approvals(approvals).with_summarizer(summarizer).with_orchestration(cfg.orchestration.to_cfg()))
+    Ok(Agent::new(client, ledger, tracer, ctx, limits).with_notifier(notifier).with_approvals(approvals).with_summarizer(summarizer).with_orchestration(cfg.orchestration.to_cfg()).with_persona(cfg.persona.to_persona()))
 }
 
 pub async fn run(cfg: &Config) -> Result<()> {

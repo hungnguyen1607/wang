@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/wang-tokens", "crates/wang-trace", "crates/wang-jail", "crates/wang-daemon", "crates/wang-evals", "crates/wang-bench", "crates/wang-proxy", "crates/wang-browser", "crates/wang-vm-agent", "crates/wang-vm", "crates/wang-cli"]
+members = ["crates/wang-tokens", "crates/wang-trace", "crates/wang-jail", "crates/wang-daemon", "crates/wang-evals", "crates/wang-bench", "crates/wang-proxy", "crates/wang-browser", "crates/wang-vm-agent", "crates/wang-vm", "crates/wang-cli", "crates/wang-voice"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,45 @@
+id = "sales-pipeline"
+prompt = "Find the month with the highest total sales in sales.csv (summing all regions), write it to best.txt as '<month> <total>', and tell me the total."
+[files]
+"sales.csv" = '''
+month,region,amount
+2026-01,north,316
+2026-01,south,316
+2026-01,east,299
+2026-02,north,447
+2026-02,south,447
+2026-02,east,430
+2026-03,north,578
+2026-03,south,578
+2026-03,east,561
+2026-04,north,709
+2026-04,south,709
+2026-04,east,692
+2026-05,north,840
+2026-05,south,840
+2026-05,east,823
+2026-06,north,971
+2026-06,south,971
+2026-06,east,954
+2026-07,north,202
+2026-07,south,202
+2026-07,east,185
+2026-08,north,333
+2026-08,south,333
+2026-08,east,316
+2026-09,north,464
+2026-09,south,464
+2026-09,east,447
+2026-10,north,595
+2026-10,south,595
+2026-10,east,578
+2026-11,north,726
+2026-11,south,726
+2026-11,east,709
+2026-12,north,857
+2026-12,south,857
+2026-12,east,840
+'''
+[check]
+reply_contains = ["2896"]
+command = "test \"$(tr -s '[:space:]' ' ' < best.txt | sed 's/ $//')\" = '2026-06 2896'"

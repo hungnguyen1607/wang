@@ -1,0 +1,12 @@
+id = "failing-build"
+prompt = "Run build.sh and tell me whether the build works. If not, why?"
+max_steps = 12
+[files]
+"build.sh" = '''
+#!/bin/bash
+echo 'checking config...'
+if [ ! -f config.yaml ]; then echo 'error: missing config.yaml' >&2; exit 2; fi
+echo built
+'''
+[check]
+reply_contains = ["config.yaml"]

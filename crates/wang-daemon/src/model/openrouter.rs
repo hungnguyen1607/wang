@@ -44,7 +44,8 @@ impl OpenRouter {
 
     pub fn build_body(model: &str, cfg: &ModelCfg, system: &str, tools: &[Value], messages: &[Value]) -> Value {
         let claude = model.starts_with("anthropic/");
-        let system_msg = if claude {
+        let hints = claude && cfg.cache_hints;
+        let system_msg = if hints {
             json!({"role": "system", "content": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]})
         } else {
             json!({"role": "system", "content": system})
@@ -60,7 +61,7 @@ impl OpenRouter {
         if !tools.is_empty() {
             body["tools"] = json!(to_chat_tools(tools));
         }
-        if claude {
+        if hints {
             body["cache_control"] = json!({"type": "ephemeral"});
         }
         if let Some(effort) = &cfg.reasoning_effort {
@@ -440,6 +441,10 @@ mod tests {
         assert_eq!(b["tools"][1]["function"]["name"], "shell");
         assert_eq!(b["stream"], true);
         let b = OpenRouter::build_body("deepseek/deepseek-v4-flash", &cfg, "sys", &[], &[]);
+        assert!(b.get("cache_control").is_none());
+        assert_eq!(b["messages"][0]["content"], "sys");
+        let off = ModelCfg { cache_hints: false, ..Default::default() };
+        let b = OpenRouter::build_body("anthropic/claude-haiku-5.5", &off, "sys", &[], &[]);
         assert!(b.get("cache_control").is_none());
         assert_eq!(b["messages"][0]["content"], "sys");
     }

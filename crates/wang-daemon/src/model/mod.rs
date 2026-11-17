@@ -180,12 +180,14 @@ pub(crate) mod testing {
     pub struct Mock {
         script: Mutex<Vec<ModelResponse>>,
         pub seen: Mutex<Vec<Vec<Value>>>,
+        /// System prompt of each call.
+        pub systems: Mutex<Vec<String>>,
     }
 
     impl Mock {
         pub fn new(mut script: Vec<ModelResponse>) -> Self {
             script.reverse();
-            Self { script: Mutex::new(script), seen: Mutex::new(vec![]) }
+            Self { script: Mutex::new(script), seen: Mutex::new(vec![]), systems: Mutex::new(vec![]) }
         }
     }
 
@@ -196,8 +198,9 @@ pub(crate) mod testing {
         fn model(&self) -> &str {
             "mock-model"
         }
-        async fn create(&self, _system: &str, tools: &[Value], messages: &[Value], ctx: &CallCtx<'_>) -> Result<ModelResponse> {
+        async fn create(&self, system: &str, tools: &[Value], messages: &[Value], ctx: &CallCtx<'_>) -> Result<ModelResponse> {
             assert!(tools.is_empty() || tools.len() == 5, "{}", tools.len());
+            self.systems.lock().unwrap().push(system.to_string());
             self.seen.lock().unwrap().push(messages.to_vec());
             let r = self.script.lock().unwrap().pop().expect("mock script exhausted");
             for b in &r.content {

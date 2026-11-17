@@ -63,7 +63,7 @@ pub struct View {
 
 /// Chrome flags: headless, no Chrome sandbox (the jail is the sandbox, and nested user
 /// namespaces are disabled in it), nothing phoning home, DevTools over the pipe only.
-fn chrome_args(bin: &str, cfg: &BrowserCfg) -> Vec<String> {
+pub(crate) fn chrome_args(bin: &str, cfg: &BrowserCfg) -> Vec<String> {
     let mut a: Vec<String> = [
         bin,
         "--headless",
@@ -114,6 +114,13 @@ pub struct Browser {
     /// Time from spawn to a ready page.
     pub launch_ms: f64,
     pub version: String,
+    /// Sites where this browser carries the user's borrowed logins.
+    signed_in: Vec<String>,
+    /// Why borrowing logins failed, if it did (shown once to the agent).
+    pub logins_error: Option<String>,
+    /// The login file's modification time at launch: if it changed since (a `wang login`),
+    /// this browser's older cookies aren't saved over it.
+    jar_mtime: Option<std::time::SystemTime>,
 }
 
 impl Browser {
@@ -156,8 +163,39 @@ impl Browser {
             }
         };
         let crashed = Arc::new(AtomicBool::new(false));
-        let mut b = Self { running, cdp, session: String::new(), frame: String::new(), crashed, cfg: cfg.clone(), launch_ms: 0.0, version };
+        let mut b = Self {
+            running,
+            cdp,
+            session: String::new(),
+            frame: String::new(),
+            crashed,
+            cfg: cfg.clone(),
+            launch_ms: 0.0,
+            version,
+            signed_in: vec![],
+            logins_error: None,
+            jar_mtime: None,
+        };
         b.cdp.call(None, "Browser.setDownloadBehavior", json!({"behavior": "deny"})).await.ok();
+        if let Some(l) = &cfg.logins {
+            if let crate::logins::LoginSource::Jar(p) = &l.source {
+                b.jar_mtime = std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            }
+            match l.load() {
+                Ok(cookies) if !cookies.is_empty() => match b.cdp.call(None, "Storage.setCookies", json!({"cookies": cookies})).await {
+                    Ok(_) => {
+                        b.signed_in = crate::logins::hosts_of(&cookies);
+                        tracing::info!(cookies = cookies.len(), sites = b.signed_in.len(), "browser: borrowed Firefox logins");
+                    }
+                    Err(e) => b.logins_error = Some(format!("couldn't load the borrowed logins: {e}")),
+                },
+                Ok(_) => b.logins_error = Some("no saved logins for the allowed sites yet (sign in with `wang browser login`)".into()),
+                Err(e) => b.logins_error = Some(format!("couldn't read the saved logins: {e:#}")),
+            }
+            if let Some(e) = &b.logins_error {
+                tracing::warn!("browser: {e}");
+            }
+        }
         b.new_page().await?;
         b.launch_ms = started.elapsed().as_secs_f64() * 1e3;
         Ok(b)
@@ -412,12 +450,65 @@ impl Browser {
         })
     }
 
+    /// wang's own login file: save the browser's current cookies for the allowed sites, so
+    /// refreshed sessions (and new logins, and logouts) persist.
+    pub async fn save_logins(&self) {
+        let Some(crate::logins::LoginsCfg { source: crate::logins::LoginSource::Jar(path), sites }) = &self.cfg.logins else { return };
+        if self.cdp.is_closed() {
+            return;
+        }
+        if std::fs::metadata(path).and_then(|m| m.modified()).ok() != self.jar_mtime {
+            tracing::info!("browser: logins were updated since this browser started; not saving its older cookies");
+            return;
+        }
+        match self.cdp.call_timeout(None, "Storage.getCookies", json!({}), Duration::from_secs(5)).await {
+            Ok(r) => {
+                let cookies = r["cookies"].as_array().cloned().unwrap_or_default();
+                if let Err(e) = crate::logins::save_jar(path, &cookies, sites, &self.signed_in) {
+                    tracing::warn!("browser: saving logins failed: {e:#}");
+                }
+            }
+            Err(e) => tracing::warn!("browser: couldn't read cookies to save logins: {e}"),
+        }
+    }
+
+    /// Is wang signed in as the user on this host?
+    pub fn signed_in_at(&self, host: &str) -> bool {
+        !self.signed_in.is_empty() && crate::logins::site_matches(host, &self.signed_in)
+    }
+
+    pub fn signed_in_hosts(&self) -> &[String] {
+        &self.signed_in
+    }
+
+    /// Guardrail: if this action would act as the user on a signed-in site, why (for the
+    /// approval prompt). `n` is the element number, `open_url` the target of an `open`.
+    pub async fn guard(&self, action: &str, n: Option<usize>, submit: bool, open_url: Option<&str>) -> Option<String> {
+        if self.signed_in.is_empty() {
+            return None;
+        }
+        let page = match open_url {
+            Some(u) => u.to_string(),
+            None => self.url().await.unwrap_or_default(),
+        };
+        let host = host_port(&page).map(|h| h.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or(h))?;
+        if !self.signed_in_at(&host) {
+            return None;
+        }
+        let info = match n {
+            Some(n) => self.eval(&format!("({})({n})", crate::guard::REF_INFO_JS)).await.ok().and_then(|v| serde_json::from_value(v).ok()),
+            None => None,
+        };
+        crate::guard::assess(action, info.as_ref(), submit, open_url).map(|why| format!("{why} on {host}, where wang is signed in as you"))
+    }
+
     pub async fn url(&self) -> Result<String> {
         Ok(self.eval("location.href").await?.as_str().unwrap_or("").to_string())
     }
 
     /// Kill the browser and its jail.
     pub async fn close(self) -> Stopped {
+        self.save_logins().await;
         let _ = self.cdp.call_timeout(None, "Browser.close", json!({}), Duration::from_secs(2)).await;
         self.running.stop().await
     }

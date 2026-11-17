@@ -20,6 +20,39 @@ pub struct Config {
     pub local: LocalConfig,
     pub mcp: McpConfig,
     pub orchestration: OrchestrationConfig,
+    pub persona: PersonaConfig,
+}
+
+/// `[persona]`: who the assistant is and how it talks. The safety rules don't change.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersonaConfig {
+    /// What it calls itself (and, for voice, the wake word).
+    pub name: String,
+    /// What it calls you.
+    pub user_name: String,
+    /// Personality and tone, in plain words.
+    pub style: String,
+    /// How replies that will be read aloud should sound (empty = a built-in default).
+    pub spoken_style: String,
+}
+
+impl Default for PersonaConfig {
+    fn default() -> Self {
+        Self { name: "wang".into(), user_name: String::new(), style: String::new(), spoken_style: String::new() }
+    }
+}
+
+impl PersonaConfig {
+    pub fn to_persona(&self) -> crate::agent::Persona {
+        let name = self.name.trim();
+        crate::agent::Persona {
+            name: if name.is_empty() { "wang".into() } else { name.to_string() },
+            user_name: self.user_name.trim().to_string(),
+            style: self.style.trim().to_string(),
+            spoken_style: self.spoken_style.trim().to_string(),
+        }
+    }
 }
 
 /// `[orchestration]`: multi-part tasks get a planner, worker agents per step and a checker.
@@ -176,6 +209,13 @@ pub struct BrowserConfig {
     pub min_free: String,
     /// Characters per page view part (~4 per token).
     pub view_chars: usize,
+    /// Where the browser's logins come from: "wang" (its own, signed in once with
+    /// `wang browser login`), "firefox" (copied from your Firefox), or "" (starts signed out).
+    pub logins: String,
+    /// Firefox profile name from profiles.ini ("" = the one Firefox opens by default).
+    pub firefox_profile: String,
+    /// Sites whose logins are borrowed ("instagram.com" covers its subdomains; "*" = every site).
+    pub login_sites: Vec<String>,
 }
 
 impl Default for BrowserConfig {
@@ -190,11 +230,40 @@ impl Default for BrowserConfig {
             idle_timeout: "5m".into(),
             min_free: "768M".into(),
             view_chars: 12_000,
+            logins: String::new(),
+            firefox_profile: String::new(),
+            login_sites: vec![],
         }
     }
 }
 
 impl BrowserConfig {
+    /// The borrowed-logins setting, or None (with a warning) if it's off or can't be used.
+    pub fn logins_cfg(&self) -> Option<wang_browser::logins::LoginsCfg> {
+        use wang_browser::logins::{LoginSource, LoginsCfg};
+        if !self.logins.trim().is_empty() && self.login_sites.is_empty() {
+            tracing::warn!("[browser] logins is set but login_sites is empty: the browser starts signed out");
+            return None;
+        }
+        match self.logins.trim() {
+            "" => None,
+            "wang" => Some(LoginsCfg { source: LoginSource::Jar(browser_logins_path()), sites: self.login_sites.clone() }),
+            "firefox" => {
+                match wang_browser::logins::find_firefox_profile(self.firefox_profile.trim()) {
+                    Ok(profile) => Some(LoginsCfg { source: LoginSource::Firefox(profile), sites: self.login_sites.clone() }),
+                    Err(e) => {
+                        tracing::warn!("[browser] logins: {e:#}; the browser starts signed out");
+                        None
+                    }
+                }
+            }
+            other => {
+                tracing::warn!("[browser] logins = {other:?} isn't supported (use \"wang\" or \"firefox\"); the browser starts signed out");
+                None
+            }
+        }
+    }
+
     pub fn to_cfg(&self) -> Result<wang_browser::BrowserCfg> {
         use wang_jail::policy::{parse_duration, parse_size};
         Ok(wang_browser::BrowserCfg {
@@ -206,6 +275,7 @@ impl BrowserConfig {
             idle_timeout: parse_duration(&self.idle_timeout)?,
             min_free_bytes: parse_size(&self.min_free)?,
             view_chars: self.view_chars.clamp(1_000, 100_000),
+            logins: self.logins_cfg(),
             ..Default::default()
         })
     }
@@ -266,6 +336,12 @@ impl Default for ApprovalsCfg {
     fn default() -> Self {
         Self { enabled: true, timeout: "10m".into() }
     }
+}
+
+/// wang's own browser logins: ~/.local/share/wang/browser-logins.json (0600). The folder is
+/// hidden from every jail, so sandboxed commands can't read it.
+pub fn browser_logins_path() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("wang/browser-logins.json")
 }
 
 /// `[memory]`: facts in ~/.local/share/wang/memory.md.
@@ -375,6 +451,8 @@ pub struct ModelCfg {
     pub fallbacks: bool,
     /// Override the API base URL (e.g. the M6 token proxy, or the M5 fake model server).
     pub base_url: Option<String>,
+    /// Send prompt-caching hints (cache_control). Off only for the eval baseline ("plain" arm).
+    pub cache_hints: bool,
 }
 
 impl Default for ModelCfg {
@@ -387,6 +465,7 @@ impl Default for ModelCfg {
             effort: "medium".into(),
             fallbacks: true,
             base_url: None,
+            cache_hints: true,
         }
     }
 }
@@ -445,6 +524,12 @@ impl Default for NtfyCfg {
 
 pub const EXAMPLE_CONFIG: &str = r#"# wang config — ~/.config/wang/config.toml
 # API keys live in ~/.config/wang/.env, not here.
+
+[persona]
+name = "wang"                            # what it calls itself (also the voice wake word), e.g. "Jarvis"
+# user_name = "Hung"                     # what it calls you
+# style = "calm, dry wit, brief; calls me sir"
+# spoken_style = ""                      # how read-aloud replies sound (empty = short plain sentences)
 
 [model]
 provider = "openrouter"                  # openrouter | anthropic

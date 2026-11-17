@@ -1,0 +1,11 @@
+id = "no-such-tool"
+prompt = "Use the frobnicate command to process input.txt and show me the result."
+max_steps = 12
+[files]
+"input.txt" = '''
+hello
+'''
+[check]
+reply_contains = ["frobnicate"]
+reply_excludes = ["frobnicated successfully"]
+command = "test \"$(ls | wc -l)\" = 1"

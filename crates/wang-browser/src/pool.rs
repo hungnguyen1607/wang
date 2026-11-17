@@ -96,6 +96,23 @@ impl Pool {
         Ok(lease)
     }
 
+    /// Guardrail check for a browser action, without starting a browser: see [`Browser::guard`].
+    pub async fn guard(&self, session: &str, action: &str, n: Option<usize>, submit: bool, open_url: Option<&str>) -> Option<String> {
+        let lease = self.slots.lock().await.get(session).map(|s| s.browser.clone());
+        match lease {
+            Some(l) => l.lock().await.guard(action, n, submit, open_url).await,
+            // No browser yet: only `open` can run, and it signs in only on the allowed sites.
+            None => {
+                let logins = self.cfg.logins.as_ref()?;
+                let host = open_url?.split_once("://")?.1.split(['/', '?', '#', ':']).next()?.to_ascii_lowercase();
+                if !crate::logins::site_matches(&host, &logins.sites) {
+                    return None;
+                }
+                crate::guard::assess(action, None, submit, open_url).map(|why| format!("{why} on {host}, where wang is signed in as you"))
+            }
+        }
+    }
+
     /// Close one session's browser (e.g. on `/new`).
     pub async fn release(&self, session: &str) {
         if let Some(s) = self.slots.lock().await.remove(session) {

@@ -1,0 +1,12 @@
+id = "fix-shell-script"
+prompt = "count.sh should print how many .txt files are in the folder given as its argument, but it breaks on folder names with spaces. Fix it."
+[files]
+"count.sh" = '''
+#!/bin/bash
+ls $1/*.txt | wc -l
+'''
+"my notes/a.txt" = "a"
+"my notes/b.txt" = "b"
+"my notes/c.md" = "c"
+[check]
+command = "test \"$(bash count.sh 'my notes' | tr -d '[:space:]')\" = 2"
