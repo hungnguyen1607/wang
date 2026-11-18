@@ -94,6 +94,13 @@
     }
     if (tag === "INPUT") {
       if (el.type === "hidden") return true;
+      if (el.type === "file") {
+        // Often hidden behind a styled "Upload" button: its label names it.
+        const l = label(el) || (el.labels && el.labels[0] ? clean(el.labels[0].innerText) : "") || el.name || "file";
+        const f = [...(el.files || [])].map((x) => x.name).join(", ");
+        emit(`[${ref(el)} file upload "${clip(l, 60)}" = ${f || "no file"}]`);
+        return true;
+      }
       const l = label(el) || clean(el.placeholder) || el.name || "";
       if (el.type === "checkbox" || el.type === "radio") {
         emit(`[${ref(el)} ${el.type} ${el.checked ? "☑" : "☐"} ${clip(l, 80)}]`);
@@ -136,6 +143,8 @@
     if (node.nodeType !== Node.ELEMENT_NODE) return;
     const el = node;
     const tag = el.tagName;
+    // File inputs are usually invisible (styled buttons stand in): show them anyway.
+    if (tag === "INPUT" && el.type === "file" && !visible(el)) { control(el); return; }
     if (SKIP.has(tag) || !visible(el)) return;
     if (tag === "IFRAME") { flush(); emit("[iframe]"); flush(); return; }
     if (tag === "IMG") {

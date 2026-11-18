@@ -25,6 +25,9 @@ pub struct RefInfo {
     /// A search box (type=search, role=searchbox, or named/labelled like one).
     #[serde(default)]
     pub search: bool,
+    /// Inside a <form> (Enter there submits it).
+    #[serde(default)]
+    pub form: bool,
 }
 
 /// Reads `__wangRefs[n-1]` (from the last view). Returns null if the element is gone.
@@ -38,7 +41,7 @@ pub const REF_INFO_JS: &str = r#"(n) => {
   const search = attr("type") === "search" || attr("role") === "searchbox" || !!el.closest("[role=search]") ||
                  /\b(search|query)\b/.test(hint) || attr("name") === "q";
   return {tag: el.tagName, type: (attr("type") || "").toLowerCase(), role: attr("role").toLowerCase(),
-          text, href: el.tagName === "A" ? (el.href || "") : "", search};
+          text, href: el.tagName === "A" ? (el.href || "") : "", search, form: !!el.closest("form")};
 }"#;
 
 /// Words that mean "this acts as you". Matched as whole words in the element's label.
@@ -49,6 +52,8 @@ const RISKY: &[&str] = &[
     "confirm", "submit", "accept", "approve", "decline", "invite", "upload", "save", "update", "apply", "change", "edit",
     "follow", "unfollow", "block", "unblock", "mute account", "report", "like", "unlike", "react", "vote",
     "add to cart", "add to bag", "place order", "sign out", "log out", "logout", "signout",
+    // Signing up / agreeing: commits the user on any site.
+    "register", "sign up", "signup", "create account", "create my account", "join", "agree", "i agree", "enroll", "enrol", "finish", "complete",
 ];
 
 /// Buttons that only move around or change what's shown.
@@ -71,6 +76,61 @@ fn has_word(label: &str, list: &[&'static str]) -> Option<&'static str> {
     let w = words(label);
     list.iter().copied().find(|p| w.contains(&format!(" {p} ")))
 }
+
+/// On **any** site: actions that commit the user (submit a form, register, agree, pay, send).
+/// Filling a form, reading and moving around stay free.
+pub fn commit_reason(action: &str, info: Option<&RefInfo>) -> Option<String> {
+    let i = info?;
+    // Ticking "I agree" isn't sending anything yet: the submit's approval shows it as ☑.
+    if matches!(i.kind.as_str(), "checkbox" | "radio") {
+        return None;
+    }
+    match action {
+        "click" => {
+            if let Some(w) = has_word(&i.text, RISKY) {
+                return Some(format!("clicking \"{}\" (looks like \"{w}\")", i.text));
+            }
+            (i.kind == "submit" && !i.search).then(|| format!("clicking \"{}\", which submits the form", if i.text.is_empty() { "submit" } else { &i.text }))
+        }
+        "type" => None,
+        _ => None,
+    }
+}
+
+/// Enter in a form field (not a search box) submits the form.
+pub fn commit_enter(info: Option<&RefInfo>, submit: bool) -> Option<String> {
+    let i = info?;
+    (submit && i.form && !i.search).then(|| format!("pressing Enter in \"{}\", which submits the form", if i.text.is_empty() { "a field" } else { &i.text }))
+}
+
+/// What a form holds right now, for the approval message. `n` = the element acted on.
+pub const FORM_JS: &str = r#"(n) => {
+  const el = (window.__wangRefs || [])[n - 1];
+  const root = (el && el.closest("form")) || document;
+  const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+  const labelOf = (f) => {
+    if (f.labels && f.labels.length) return clean(f.labels[0].innerText);
+    return clean(f.getAttribute("aria-label") || f.placeholder || f.name || f.id || f.type);
+  };
+  const out = [];
+  for (const f of root.querySelectorAll("input, select, textarea")) {
+    if (out.length >= 25) break;
+    const t = (f.type || "").toLowerCase();
+    if (["hidden", "submit", "button", "reset", "image"].includes(t)) continue;
+    const r = f.getBoundingClientRect();
+    if (t !== "file" && !r.width && !r.height) continue;
+    let v;
+    if (t === "password") v = f.value ? "••••" : "";
+    else if (t === "checkbox" || t === "radio") { if (!f.checked && t === "radio") continue; v = f.checked ? "☑" : "☐"; }
+    else if (t === "file") v = Array.from(f.files || []).map((x) => x.name).join(", ");
+    else if (f.tagName === "SELECT") v = f.selectedOptions[0] ? clean(f.selectedOptions[0].text) : "";
+    else v = clean(f.value).slice(0, 80);
+    if (v === "" && t !== "checkbox") continue;
+    const l = labelOf(f).slice(0, 40);
+    out.push(t === "checkbox" || t === "radio" ? `${v} ${l}` : `${l}: ${v}`);
+  }
+  return out.join(" · ");
+}"#;
 
 /// Why this action on a signed-in page needs approval, or None if it's free.
 /// `info` is None when the element can't be read (the action will then fail on its own).
@@ -121,7 +181,35 @@ mod tests {
     use super::*;
 
     fn el(tag: &str, kind: &str, role: &str, text: &str, href: &str, search: bool) -> RefInfo {
-        RefInfo { tag: tag.into(), kind: kind.into(), role: role.into(), text: text.into(), href: href.into(), search }
+        RefInfo { tag: tag.into(), kind: kind.into(), role: role.into(), text: text.into(), href: href.into(), search, form: false }
+    }
+
+    #[test]
+    fn committing_asks_on_any_site() {
+        for (tag, kind, text) in [
+            ("BUTTON", "", "Register"),
+            ("BUTTON", "", "Sign up"),
+            ("A", "", "Create account"),
+            ("BUTTON", "", "I agree"),
+            ("INPUT", "submit", "Continue"),
+            ("BUTTON", "", "Apply now"),
+            ("BUTTON", "", "Pay $20"),
+        ] {
+            assert!(commit_reason("click", Some(&el(tag, kind, "", text, "", false))).is_some(), "{text}");
+        }
+        for (tag, kind, text) in [("BUTTON", "", "Next"), ("BUTTON", "", "Show more"), ("A", "", "FAQ"), ("INPUT", "submit", "Search")] {
+            let search = text == "Search";
+            assert_eq!(commit_reason("click", Some(&el(tag, kind, "", text, "https://x/", search))), None, "{text}");
+        }
+        assert_eq!(commit_reason("type", Some(&el("INPUT", "", "", "Name", "", false))), None, "filling in is free");
+        let mut field = el("INPUT", "", "", "Email", "", false);
+        field.form = true;
+        assert!(commit_enter(Some(&field), true).is_some());
+        assert_eq!(commit_enter(Some(&field), false), None);
+        field.search = true;
+        assert_eq!(commit_enter(Some(&field), true), None, "Enter in a search box");
+        assert!(has_word("Joining instructions", RISKY).is_none(), "whole words only");
+        assert_eq!(commit_reason("click", Some(&el("INPUT", "checkbox", "", "I agree to the code of conduct", "", false))), None, "the submit shows it");
     }
 
     #[test]

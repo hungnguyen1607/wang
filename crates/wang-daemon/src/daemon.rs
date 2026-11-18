@@ -46,6 +46,28 @@ pub async fn build_sandbox(cfg: &Config) -> Result<Sandbox> {
     Ok(Sandbox::Jailed { jail: Arc::new(jail), policy })
 }
 
+/// `[model] provider = "claude-code" | "codex"`: think on the user's own subscription.
+fn brain(cfg: &Config, ctx: &ToolCtx) -> Result<Option<Arc<crate::brain::CliBrain>>> {
+    let Some(kind) = crate::brain::Kind::from_provider(&cfg.model.provider) else { return Ok(None) };
+    // An OpenRouter-style id ("anthropic/claude-haiku-5.5") means nothing to the CLI: use its default.
+    let model = cfg.model.model.clone().filter(|m| !m.contains('/') && !m.is_empty());
+    let jail = match ctx.sandbox.as_ref() {
+        Sandbox::Jailed { jail, .. } => Some(jail.clone()),
+        _ => None,
+    };
+    let b = crate::brain::CliBrain::new(kind, model, jail)?;
+    tracing::info!("brain: {} ({}) via {}{}", kind.plan(), b.model.as_deref().unwrap_or("its default model"), b.bin.display(), if b.jail.is_some() { ", jailed" } else { "" });
+    Ok(Some(Arc::new(b)))
+}
+
+/// `wang mcp --via-daemon`: a brain CLI's hands. Forwards tools to the running daemon, which
+/// runs them with its approvals (phone buttons), sandbox, logins, ledger and trace.
+pub async fn run_mcp_proxy(socket: std::path::PathBuf, session: String) -> Result<()> {
+    let ctx = ToolCtx::with(std::env::temp_dir(), Sandbox::Off, WebPolicy::default());
+    let server = Arc::new(crate::mcp::McpServer { ctx, ledger: None, session, allow_privileged: true, output_cap: 40_000, remote: Some(socket) });
+    server.serve_stdio().await
+}
+
 /// `wang mcp`: serve wang's tools to Claude Code / Claude Desktop over stdio.
 pub async fn run_mcp(cfg: &Config) -> Result<()> {
     let sandbox = build_sandbox(cfg).await?;
@@ -60,6 +82,7 @@ pub async fn run_mcp(cfg: &Config) -> Result<()> {
         session: format!("mcp-{}", std::process::id()),
         allow_privileged: cfg.mcp.allow_privileged,
         output_cap: cfg.agent.tool_output_cap.max(20_000),
+        remote: None,
     });
     tracing::info!("wang mcp ready on stdio");
     // The client closes stdin, or sends SIGTERM, when it's done: clean up either way.
@@ -78,7 +101,28 @@ pub async fn run_mcp(cfg: &Config) -> Result<()> {
 pub fn tool_ctx(cfg: &Config, sandbox: Sandbox, workdir: std::path::PathBuf, web: WebPolicy, memory: Option<Arc<Memory>>) -> Result<ToolCtx> {
     let browser = browser_pool(cfg, &sandbox)?;
     let vms = vm_sessions(cfg, &sandbox)?;
-    Ok(ToolCtx::with(workdir, sandbox, web).with_memory(memory).with_browser(browser).with_vm(vms))
+    let skills = crate::skills::Skills::new(crate::skills::skills_dir());
+    match skills.install_starters() {
+        Ok(added) if !added.is_empty() => tracing::info!("installed starter skills: {}", added.join(", ")),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("skills: {e:#}"),
+    }
+    let desktop = if cfg.desktop.enabled {
+        match wang_desktop::Desktop::available() {
+            Ok(()) => {
+                let d = wang_desktop::Desktop::new(wang_desktop::Desktop::default_dir());
+                tracing::info!("desktop control on{}", if d.screen_ready() { " (with screen control)" } else { " (accessibility only; `wang setup screen` adds screenshots + keys)" });
+                Some(Arc::new(d))
+            }
+            Err(e) => {
+                tracing::info!("desktop control off: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    Ok(ToolCtx::with(workdir, sandbox, web).with_memory(memory).with_browser(browser).with_vm(vms).with_skills(Some(Arc::new(skills))).with_desktop(desktop))
 }
 
 /// The browser pool, when `[browser]` is on, the sandbox works and a Chrome is installed.
@@ -232,9 +276,12 @@ pub fn build_agent(cfg: &Config, sandbox: Sandbox, tg: Option<&Arc<Bot>>) -> Res
         None
     };
     let schedules = Arc::new(crate::schedule::Store::open(&db)?);
-    let ctx = tool_ctx(cfg, sandbox, workdir, web, memory)?.with_schedules(Some(schedules));
+    let watches = if cfg.proactive.enabled { Some(Arc::new(crate::watch::Store::open(&db)?)) } else { None };
+    let ctx = tool_ctx(cfg, sandbox, workdir, web, memory)?.with_schedules(Some(schedules)).with_watches(watches);
     let summarizer = local_model(cfg, ctx.sandbox.as_ref())?;
-    Ok(Agent::new(client, ledger, tracer, ctx, limits).with_notifier(notifier).with_approvals(approvals).with_summarizer(summarizer).with_orchestration(cfg.orchestration.to_cfg()).with_persona(cfg.persona.to_persona()))
+    let brain = brain(cfg, &ctx)?;
+    Ok(Agent::new(client, ledger, tracer, ctx, limits)
+        .with_brain(brain).with_notifier(notifier).with_approvals(approvals).with_summarizer(summarizer).with_orchestration(cfg.orchestration.to_cfg()).with_persona(cfg.persona.to_persona()))
 }
 
 pub async fn run(cfg: &Config) -> Result<()> {
@@ -269,6 +316,24 @@ pub async fn run(cfg: &Config) -> Result<()> {
         }
     };
 
+    // Proactive check-ins: watches look on their own and ping where they were set up.
+    let watcher = {
+        let store = hub.agent.ctx.watches.clone();
+        let delivery = Arc::new(crate::schedule::Delivery { bot: tg.clone(), notifier: hub.agent.notifier.clone() });
+        let hub = hub.clone();
+        let pcfg = cfg.proactive.to_cfg()?;
+        async move {
+            match store {
+                Some(store) if hub.agent.ctx.browser.is_some() => {
+                    let n = store.list(None).map(|l| l.len()).unwrap_or(0);
+                    tracing::info!("watches on ({n}); quiet hours {}, max {} pings/day", pcfg.quiet_hours, pcfg.max_pings_per_day);
+                    crate::watch::run(hub, store, delivery, pcfg).await
+                }
+                _ => std::future::pending().await,
+            }
+        }
+    };
+
     let telegram = async {
         match tg {
             Some(bot) => {
@@ -287,6 +352,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
         r = socket.serve(hub.clone()) => r,
         r = telegram => r,
         r = scheduler => r,
+        r = watcher => r,
         _ = tokio::signal::ctrl_c() => { tracing::info!("interrupted, shutting down"); Ok(()) }
         _ = term.recv() => { tracing::info!("SIGTERM, shutting down"); Ok(()) }
     };

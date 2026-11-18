@@ -21,6 +21,8 @@ pub struct OpenRouter {
     base_url: String,
     cfg: ModelCfg,
     model: String,
+    /// openrouter | deepseek | openai (any OpenAI-compatible API).
+    name: &'static str,
 }
 
 impl OpenRouter {
@@ -39,7 +41,12 @@ impl OpenRouter {
             .unwrap_or_else(|| "https://openrouter.ai/api/v1".into())
             .trim_end_matches('/')
             .to_string();
-        Ok(Self { http: http_client()?, api_key, base_url, cfg: cfg.clone(), model: cfg.model_id() })
+        let name = match cfg.provider.as_str() {
+            "deepseek" => "deepseek",
+            "openai" => "openai",
+            _ => "openrouter",
+        };
+        Ok(Self { http: http_client()?, api_key, base_url, cfg: cfg.clone(), model: cfg.model_id(), name })
     }
 
     pub fn build_body(model: &str, cfg: &ModelCfg, system: &str, tools: &[Value], messages: &[Value]) -> Value {
@@ -109,6 +116,19 @@ pub fn to_chat_messages(messages: &[Value]) -> Vec<Value> {
                         text = format!("[tool error]\n{text}");
                     }
                     out.push(json!({"role": "tool", "tool_call_id": b["tool_use_id"], "content": text}));
+                }
+                // Chat-completions tool messages can't hold images: they follow as a user message.
+                let images: Vec<Value> = blocks
+                    .iter()
+                    .filter(|b| b["type"] == "tool_result")
+                    .flat_map(|b| b["content"].as_array().cloned().unwrap_or_default())
+                    .filter(|p| p["type"] == "image")
+                    .map(|p| json!({"type": "image_url", "image_url": {"url": format!("data:{};base64,{}", p["source"]["media_type"].as_str().unwrap_or("image/jpeg"), p["source"]["data"].as_str().unwrap_or(""))}}))
+                    .collect();
+                if !images.is_empty() {
+                    let mut parts = vec![json!({"type": "text", "text": "[screenshot from the tool call above]"})];
+                    parts.extend(images);
+                    out.push(json!({"role": "user", "content": parts}));
                 }
                 let texts: Vec<&str> =
                     blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
@@ -335,7 +355,7 @@ impl StreamAcc {
 
 impl ModelClient for OpenRouter {
     fn provider(&self) -> &'static str {
-        "openrouter"
+        self.name
     }
     fn model(&self) -> &str {
         &self.model

@@ -6,10 +6,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+toml_edit = "0.22"
 wang-tokens = { path = "../wang-tokens" }
 wang-trace = { path = "../wang-trace" }
 wang-jail = { path = "../wang-jail" }
 wang-browser = { path = "../wang-browser" }
+wang-desktop = { path = "../wang-desktop" }
 wang-vm = { path = "../wang-vm" }
 anyhow.workspace = true
 serde.workspace = true

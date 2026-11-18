@@ -12,7 +12,7 @@ pub mod openrouter;
 use std::future::Future;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use wang_tokens::Usage;
 
@@ -64,12 +64,36 @@ pub trait ModelClient: Send + Sync + 'static {
 pub enum Provider {
     Anthropic(Anthropic),
     OpenRouter(OpenRouter),
+    /// No API model: the brain is a subscription CLI and no fallback key is set. Anything
+    /// that needs a direct model call (history summaries) says so instead.
+    Unavailable(String),
 }
 
 impl Provider {
     pub fn from_config(cfg: &ModelCfg) -> Result<Self> {
+        if crate::brain::Kind::from_provider(&cfg.provider).is_some() {
+            return Ok(match cfg.fallback.as_deref().filter(|f| !f.is_empty()) {
+                Some(f) => {
+                    let fb = ModelCfg { provider: f.to_string(), model: cfg.fallback_model.clone(), ..cfg.clone() };
+                    Provider::from_config(&fb).with_context(|| format!("[model] fallback = \"{f}\""))?
+                }
+                None => Provider::Unavailable(format!(
+                    "wang's brain is your {} subscription (CLI); there's no API model for this. Set [model] fallback = \"openrouter\" and a key to enable it.",
+                    cfg.provider
+                )),
+            });
+        }
         Ok(match cfg.provider.as_str() {
             "anthropic" => Provider::Anthropic(Anthropic::new(cfg)?),
+            "deepseek" | "openai" => {
+                let env = cfg.api_key_env.clone().unwrap_or_else(|| if cfg.provider == "deepseek" { "DEEPSEEK_API_KEY".into() } else { "OPENAI_API_KEY".into() });
+                let key = std::env::var(&env).ok().filter(|k| !k.trim().is_empty()).with_context(|| format!("{env} is not set (put it in ~/.config/wang/.env)"))?;
+                let mut c = cfg.clone();
+                if c.base_url.is_none() {
+                    c.base_url = Some(if cfg.provider == "deepseek" { "https://api.deepseek.com".into() } else { "https://api.openai.com/v1".into() });
+                }
+                Provider::OpenRouter(OpenRouter::with_key(&c, key.trim().to_string())?)
+            }
             _ => Provider::OpenRouter(OpenRouter::new(cfg)?),
         })
     }
@@ -80,18 +104,21 @@ impl ModelClient for Provider {
         match self {
             Provider::Anthropic(c) => c.provider(),
             Provider::OpenRouter(c) => c.provider(),
+            Provider::Unavailable(_) => "none",
         }
     }
     fn model(&self) -> &str {
         match self {
             Provider::Anthropic(c) => c.model(),
             Provider::OpenRouter(c) => c.model(),
+            Provider::Unavailable(_) => "none",
         }
     }
     async fn create(&self, system: &str, tools: &[Value], messages: &[Value], ctx: &CallCtx<'_>) -> Result<ModelResponse> {
         match self {
             Provider::Anthropic(c) => c.create(system, tools, messages, ctx).await,
             Provider::OpenRouter(c) => c.create(system, tools, messages, ctx).await,
+            Provider::Unavailable(why) => anyhow::bail!("{why}"),
         }
     }
 }

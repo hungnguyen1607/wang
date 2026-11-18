@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod approvals;
+pub mod brain;
 pub mod config;
 pub mod daemon;
 pub mod mcp;
@@ -13,8 +14,10 @@ pub mod orchestrate;
 pub mod protocol;
 pub mod schedule;
 pub mod server;
+pub mod skills;
 pub mod telegram;
 pub mod tools;
+pub mod watch;
 pub mod workflow;
 
 pub use agent::{Agent, Conversation};

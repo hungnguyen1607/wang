@@ -1,3 +1,4 @@
+mod phone;
 mod setup;
 
 use std::io::{IsTerminal, Write};
@@ -32,8 +33,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Guided first run: checks, Claude Code hookup, API key, background service (asks before each)
-    Setup,
+    /// Guided setup: API key, phone (Telegram, QR pairing), always-on, logins (asks before each change)
+    Setup {
+        /// Only this part: phone | awake | logins | screen
+        #[arg(value_enum)]
+        step: Option<setup::Step>,
+    },
     /// Anything that isn't a command is a task: `wang fix the typo in notes.txt`
     #[command(external_subcommand)]
     Task(Vec<String>),
@@ -150,7 +155,22 @@ enum Cmd {
         action: ScheduleAction,
     },
     /// Serve wang's tools to Claude Code / Claude Desktop (MCP over stdio): `claude mcp add wang -- wang mcp`
-    Mcp,
+    Mcp {
+        /// Forward tools to the running daemon (how a subscription brain gets its hands)
+        #[arg(long)]
+        via_daemon: bool,
+        /// Session the calls belong to (with --via-daemon)
+        #[arg(long, default_value = "mcp")]
+        session: String,
+        /// Daemon socket (with --via-daemon; default: $WANG_SOCKET or the usual one)
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// wang's skills (how-tos in ~/.config/wang/skills): list, show, add, rm
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
     /// Small local model (llama.cpp, in the jail) for history summaries at $0
     Local {
         #[command(subcommand)]
@@ -189,6 +209,18 @@ enum ScheduleAction {
     List,
     /// Stop one
     Rm { id: i64 },
+}
+
+#[derive(Subcommand)]
+enum SkillAction {
+    /// All skills, with when each is used
+    List,
+    /// Print one skill's instructions
+    Show { name: String },
+    /// Install a skill from a folder or SKILL.md file (shows it and asks first)
+    Add { path: PathBuf },
+    /// Delete a skill
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -484,7 +516,7 @@ async fn main() -> Result<()> {
     };
     match cmd {
         Cmd::Task(words) => task(&cfg_path, words.join(" ")).await,
-        Cmd::Setup => setup::setup(&cfg_path).await,
+        Cmd::Setup { step } => setup::setup(&cfg_path, step).await,
         Cmd::Doctor => {
             config::load_env();
             let cfg = Config::load(&cfg_path)?;
@@ -546,11 +578,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Mcp => {
+        Cmd::Mcp { via_daemon: true, session, socket } => wang_daemon::daemon::run_mcp_proxy(socket.unwrap_or_else(config::socket_path), session).await,
+        Cmd::Mcp { .. } => {
             config::load_env();
             let cfg = Config::load(&cfg_path)?;
             wang_daemon::daemon::run_mcp(&cfg).await
         }
+        Cmd::Skill { action } => skill_cmd(action),
         Cmd::Local { action } => {
             let cfg = Config::load(&cfg_path)?;
             local_cmd(&cfg, action).await
@@ -686,7 +720,7 @@ async fn bare(cfg_path: &std::path::Path) -> Result<()> {
             println!("wang isn't set up yet: run `wang setup` (or `wang --help`).");
             return Ok(());
         }
-        setup::setup(cfg_path).await?;
+        setup::setup(cfg_path, None).await?;
         config::load_env();
         println!();
     }
@@ -730,6 +764,62 @@ async fn login(cfg: &Config, sites: &[String]) -> Result<()> {
         "Actions that could act as you there (send, post, buy, delete, buttons) will ask you first.\n\
          New browsers start with these logins; one wang already has open picks them up after it closes (idle timeout)."
     );
+    Ok(())
+}
+
+fn skill_cmd(action: SkillAction) -> Result<()> {
+    use wang_daemon::skills::{Skills, parse, skills_dir};
+    let sk = Skills::new(skills_dir());
+    match action {
+        SkillAction::List => {
+            let all = sk.list();
+            if all.is_empty() {
+                println!("No skills yet in {}. wang installs starters when the daemon starts.", sk.dir.display());
+            }
+            for k in all {
+                println!("{:<20} {}", k.name, k.description);
+            }
+        }
+        SkillAction::Show { name } => print!("{}\n", sk.load(&name)?),
+        SkillAction::Rm { name } => {
+            if !sk.remove(&name)? {
+                bail!("no skill named '{name}'");
+            }
+            println!("removed {name}");
+        }
+        SkillAction::Add { path } => {
+            let file = if path.is_dir() { path.join("SKILL.md") } else { path.clone() };
+            let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+            let (name, description, body) = parse(&text).context("not a skill: SKILL.md needs a --- frontmatter --- with name and description")?;
+            println!("{}\n", "─".repeat(60));
+            println!("{}", text.trim());
+            println!("{}\n", "─".repeat(60));
+            println!("A skill is instructions wang follows as if you wrote them. Read it above: only add skills you trust.");
+            if sk.get(&name).is_some() {
+                println!("(This replaces your existing skill '{name}'.)");
+            }
+            print!("Add skill '{name}'? [y/N] ");
+            use std::io::Write as _;
+            std::io::stdout().flush()?;
+            let mut a = String::new();
+            std::io::stdin().read_line(&mut a)?;
+            if !a.trim().to_ascii_lowercase().starts_with('y') {
+                println!("not added");
+                return Ok(());
+            }
+            let p = sk.save(&name, &description, &body)?;
+            // Helper files next to SKILL.md come along.
+            if path.is_dir() {
+                for e in std::fs::read_dir(&path)?.flatten() {
+                    let n = e.file_name();
+                    if n != "SKILL.md" && e.path().is_file() {
+                        std::fs::copy(e.path(), p.with_file_name(&n))?;
+                    }
+                }
+            }
+            println!("added {} → {}", name, p.display());
+        }
+    }
     Ok(())
 }
 
@@ -779,6 +869,13 @@ fn rate(task: Option<i64>, good: bool) -> Result<i64> {
 }
 
 fn service_install() -> Result<()> {
+    let (unit_path, _) = write_service_unit()?;
+    println!("wrote {}\n\nStart it with:\n  systemctl --user daemon-reload\n  systemctl --user enable --now wang\n\nLogs:\n  journalctl --user -u wang -f", unit_path.display());
+    Ok(())
+}
+
+/// Write the systemd user unit for this binary. Returns its path and whether it changed.
+fn write_service_unit() -> Result<(PathBuf, bool)> {
     let exe = std::env::current_exe()?.canonicalize()?;
     let path = std::env::var("PATH").unwrap_or_default();
     let unit = format!(
@@ -805,9 +902,11 @@ WantedBy=default.target
     let dir = dirs_config().join("systemd/user");
     std::fs::create_dir_all(&dir)?;
     let unit_path = dir.join("wang.service");
-    std::fs::write(&unit_path, unit)?;
-    println!("wrote {}\n\nStart it with:\n  systemctl --user daemon-reload\n  systemctl --user enable --now wang\n\nLogs:\n  journalctl --user -u wang -f", unit_path.display());
-    Ok(())
+    let changed = std::fs::read_to_string(&unit_path).ok().as_deref() != Some(unit.as_str());
+    if changed {
+        std::fs::write(&unit_path, unit)?;
+    }
+    Ok((unit_path, changed))
 }
 
 fn dirs_config() -> PathBuf {
@@ -915,7 +1014,7 @@ async fn run_message(c: &mut Client, p: &mut Printer, lines: &mut StdinLines, se
                 eprintln!("error: {message}");
                 return Ok(None);
             }
-            ServerMsg::Ok => {}
+            ServerMsg::Ok | ServerMsg::Tools { .. } | ServerMsg::ToolResult { .. } => {}
         }
     }
 }

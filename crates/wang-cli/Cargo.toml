@@ -18,6 +18,7 @@ wang-evals = { path = "../wang-evals" }
 wang-bench = { path = "../wang-bench" }
 wang-proxy = { path = "../wang-proxy" }
 wang-browser = { path = "../wang-browser" }
+wang-desktop = { path = "../wang-desktop" }
 wang-vm = { path = "../wang-vm" }
 anyhow.workspace = true
 serde_json.workspace = true
@@ -26,3 +27,9 @@ clap.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+reqwest.workspace = true
+toml_edit = "0.22"
+qrcode = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+toml.workspace = true

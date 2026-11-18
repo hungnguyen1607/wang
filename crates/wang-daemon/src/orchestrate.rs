@@ -385,7 +385,7 @@ impl<C: ModelClient> Agent<C> {
                 let _ = self.ledger.finish_task(task_id, m.calls, "plan_denied");
                 conv.push_user_text(text);
                 conv.messages.push(json!({"role": "assistant", "content": [{"type": "text", "text": reply}]}));
-                return Ok(TurnResult { reply, usage: m.usage, cost_usd: m.cost, calls: m.calls, task_id, outcome: "plan_denied".into(), workflow: Workflow::Plan });
+                return Ok(TurnResult { reply, usage: m.usage, cost_usd: m.cost, calls: m.calls, task_id, outcome: "plan_denied".into(), workflow: Workflow::Plan, note: None });
             }
         }
 
@@ -508,6 +508,7 @@ impl<C: ModelClient> Agent<C> {
             task_id,
             outcome: outcome.into(),
             workflow: Workflow::Plan,
+            note: None,
         })
     }
 }

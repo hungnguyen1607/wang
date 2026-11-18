@@ -90,11 +90,13 @@ pub struct Conversation {
     pub messages: Vec<Value>,
     /// Prompt size of the latest model call (drives history compaction).
     pub last_prompt_tokens: u64,
+    /// The brain CLI's own session id (Claude Code / Codex), resumed on the next message.
+    pub cli_session: Option<String>,
 }
 
 impl Conversation {
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into(), messages: Vec::new(), last_prompt_tokens: 0 }
+        Self { id: id.into(), messages: Vec::new(), last_prompt_tokens: 0, cli_session: None }
     }
 
     /// Append user text. If the history already ends with a user message (e.g. tool
@@ -121,10 +123,15 @@ pub struct TurnResult {
     pub task_id: i64,
     pub outcome: String,
     pub workflow: Workflow,
+    /// Replaces the token/$ part of the footer (e.g. "via your Claude subscription").
+    pub note: Option<String>,
 }
 
 impl TurnResult {
     pub fn footer(&self) -> String {
+        if let Some(n) = &self.note {
+            return format!("— task #{} · {} tool call{} · {n}", self.task_id, self.calls, if self.calls == 1 { "" } else { "s" });
+        }
         format!(
             "— task #{} · {} · {} call{} · {} in ({:.0}% cached) · {} out · ${:.4}",
             self.task_id,
@@ -196,8 +203,13 @@ pub struct Agent<C> {
     pub orchestration: crate::orchestrate::OrchestrationCfg,
     tools: Vec<Value>,
     /// System prompt (from the persona), fixed for the agent's lifetime.
-    system: String,
+    pub(crate) system: String,
     pub persona: Persona,
+    /// Thinking on the user's own subscription (Claude Code / Codex) instead of `client`.
+    /// Switchable while running (Telegram `/brain`).
+    pub brain: std::sync::RwLock<Option<Arc<crate::brain::CliBrain>>>,
+    /// Brain turns in progress, by session: where their tool calls report.
+    pub(crate) cli_turns: std::sync::Mutex<HashMap<String, crate::brain::CliTurn>>,
 }
 
 /// How often one exact call (tool + input) has been made / has failed in this task.
@@ -212,12 +224,29 @@ struct CallCount {
     last_output: Option<(u64, String)>,
 }
 
-struct ToolOutcome {
-    block: Value,
-    is_error: bool,
+pub(crate) struct ToolOutcome {
+    pub(crate) block: Value,
+    pub(crate) is_error: bool,
     error: String,
     output_hash: u64,
     id: String,
+}
+
+fn has_image(block: &Value) -> bool {
+    block["content"].as_array().is_some_and(|c| c.iter().any(|p| p["type"] == "image"))
+}
+
+/// Replace images in earlier tool results with a short note.
+pub(crate) fn drop_old_images(messages: &mut [Value]) {
+    for m in messages.iter_mut().filter(|m| m["role"] == "user") {
+        for b in m["content"].as_array_mut().into_iter().flatten() {
+            if let Some(parts) = b["content"].as_array_mut() {
+                for p in parts.iter_mut().filter(|p| p["type"] == "image") {
+                    *p = json!({"type": "text", "text": "[older screenshot removed; take a new one if you need to see the screen]"});
+                }
+            }
+        }
+    }
 }
 
 fn hash_text(s: &str) -> u64 {
@@ -243,7 +272,21 @@ impl<C: ModelClient> Agent<C> {
         let tools = tools::definitions_for(&ctx);
         let persona = Persona::default();
         let system = system_prompt(&persona);
-        Self { client, ledger, tracer, ctx, limits, notifier: None, approvals: None, summarizer: None, orchestration: Default::default(), tools, system, persona }
+        Self { client, ledger, tracer, ctx, limits, notifier: None, approvals: None, summarizer: None, orchestration: Default::default(), tools, system, persona, brain: Default::default(), cli_turns: Default::default() }
+    }
+
+    pub fn with_brain(self, b: Option<Arc<crate::brain::CliBrain>>) -> Self {
+        *self.brain.write().unwrap() = b;
+        self
+    }
+
+    pub fn current_brain(&self) -> Option<Arc<crate::brain::CliBrain>> {
+        self.brain.read().unwrap().clone()
+    }
+
+    /// Is there an API model to fall back on (or to use when no brain CLI is set)?
+    pub fn has_api_model(&self) -> bool {
+        self.client.provider() != "none"
     }
 
     pub fn with_persona(mut self, p: Persona) -> Self {
@@ -411,6 +454,15 @@ impl<C: ModelClient> Agent<C> {
     /// Handle one user message: multi-part tasks go to the orchestrator (planner + worker agents),
     /// everything else to the single agent loop with the matching workflow.
     pub async fn run_turn(&self, conv: &mut Conversation, source: &str, text: &str, events: Events<'_>) -> Result<TurnResult> {
+        if let Some(b) = self.current_brain() {
+            match self.run_cli_turn(&b, conv, source, text, events).await {
+                // The subscription ran out: finish on the API model if there is one.
+                Err(e) if self.has_api_model() && crate::brain::is_limit(&format!("{e:#}")) => {
+                    events(ServerMsg::Text { delta: format!("({e:#} Using {} / {} instead.)\n\n", self.client.provider(), self.client.model()) });
+                }
+                r => return r,
+            }
+        }
         // Pick the workflow (or honor a /research /code /quick /general /plan prefix).
         let (wf, body) = workflow::classify(text);
         if wf == Workflow::Plan {
@@ -420,6 +472,34 @@ impl<C: ModelClient> Agent<C> {
             return self.run_loop(conv, source, Workflow::General, &body, events).await;
         }
         self.run_loop(conv, source, wf, &body, events).await
+    }
+
+    /// The user's message plus what rides with it: relevant saved facts (not in the system
+    /// prompt, so the cached prefix stays identical), workflow guidance, spoken-reply style.
+    pub(crate) fn decorate(&self, text: &str, source: &str, wf: Workflow) -> String {
+        let mut user_text = text.to_string();
+        if let Some(mem) = &self.ctx.memory {
+            let hits: Vec<String> = mem.search(text, 3).into_iter().map(|(_, f)| f).collect();
+            if !hits.is_empty() {
+                user_text += "\n\n[From your saved memory; may be relevant]\n";
+                user_text += &hits.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
+            }
+        }
+        if let Some(sk) = &self.ctx.skills {
+            let idx = sk.index(1500);
+            if !idx.is_empty() {
+                user_text += "\n\n[Your skills: load one with the skill tool if it fits this request]\n";
+                user_text += idx.trim_end();
+            }
+        }
+        let guidance = wf.guidance(self.ctx.vm.is_some());
+        if !guidance.is_empty() {
+            user_text += &format!("\n\n[wang workflow: {}] {guidance}", wf.name());
+        }
+        if let Some(g) = self.persona.reply_guidance(source) {
+            user_text += &format!("\n\n[spoken reply] {g}");
+        }
+        user_text
     }
 
     /// The single agent loop: model → tools → results → repeat, under one workflow.
@@ -445,26 +525,11 @@ impl<C: ModelClient> Agent<C> {
             }
         }
         let rollback_len = conv.messages.len();
-        // Attach relevant saved facts to the user's message (not the system prompt: the
-        // cached prefix stays identical).
-        let mut user_text = text.to_string();
-        if let Some(mem) = &self.ctx.memory {
-            let hits: Vec<String> = mem.search(text, 3).into_iter().map(|(_, f)| f).collect();
-            if !hits.is_empty() {
-                if let Some(r) = root {
-                    let _ = self.tracer.annotate(r, json!({"wang.memory.recalled": hits.len()}));
-                }
-                user_text += "\n\n[From your saved memory; may be relevant]\n";
-                user_text += &hits.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
-            }
-        }
-        // Workflow guidance rides with the message (the system prompt and tool list stay fixed for caching).
-        let guidance = wf.guidance(vm);
-        if !guidance.is_empty() {
-            user_text += &format!("\n\n[wang workflow: {}] {guidance}", wf.name());
-        }
-        if let Some(g) = self.persona.reply_guidance(source) {
-            user_text += &format!("\n\n[spoken reply] {g}");
+        let user_text = self.decorate(text, source, wf);
+        if let Some(r) = root
+            && user_text.contains("[From your saved memory")
+        {
+            let _ = self.tracer.annotate(r, json!({"wang.memory.recalled": true}));
         }
         conv.push_user_text(&user_text);
 
@@ -623,6 +688,11 @@ impl<C: ModelClient> Agent<C> {
                     c.last_output = Some((o.output_hash, o.id.clone()));
                 }
                 let results: Vec<Value> = outcomes.into_iter().map(|o| o.block).collect();
+                // Only the newest screenshots stay in the history: each old one would be paid
+                // for again on every call.
+                if results.iter().any(has_image) {
+                    drop_old_images(&mut conv.messages);
+                }
                 conv.messages.push(json!({"role": "user", "content": results}));
 
                 // Loop detection: the same exact call failing (or just repeating) too often.
@@ -676,7 +746,7 @@ impl<C: ModelClient> Agent<C> {
                     json!({"wang.outcome": status, "wang.steps": calls, "wang.cost_usd": cost,
                            "gen_ai.usage.input_tokens": usage.prompt_tokens(), "gen_ai.usage.output_tokens": usage.output_tokens}),
                 );
-                Ok(TurnResult { reply, usage, cost_usd: cost, calls, task_id, outcome: status.to_string(), workflow: wf })
+                Ok(TurnResult { reply, usage, cost_usd: cost, calls, task_id, outcome: status.to_string(), workflow: wf, note: None })
             }
             Err(e) => {
                 let _ = self.ledger.finish_task(task_id, calls, "error");
@@ -691,7 +761,7 @@ impl<C: ModelClient> Agent<C> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn exec_tool(
+    pub(crate) async fn exec_tool(
         &self,
         session: &str,
         allowed: Option<&[&str]>,
@@ -815,7 +885,13 @@ impl<C: ModelClient> Agent<C> {
         self.end(span, if out.is_error { Status::Error } else { Status::Ok }, attrs);
         events(ServerMsg::ToolEnd { name: name.to_string(), ok: !out.is_error, ms, trimmed: capped.truncated(), repeated });
 
-        let mut block = json!({"type": "tool_result", "tool_use_id": id, "content": capped.text});
+        let mut block = match &out.image {
+            Some(img) => json!({"type": "tool_result", "tool_use_id": id, "content": [
+                {"type": "text", "text": capped.text},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img}},
+            ]}),
+            None => json!({"type": "tool_result", "tool_use_id": id, "content": capped.text}),
+        };
         if out.is_error {
             block["is_error"] = json!(true);
         }

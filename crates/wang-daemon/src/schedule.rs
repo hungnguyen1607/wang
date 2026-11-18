@@ -395,6 +395,22 @@ pub struct Delivery {
 }
 
 impl Delivery {
+    /// A proactive ping to where `session` lives (its Telegram chat), else the alerts.
+    pub async fn ping(&self, session: &str, text: &str) {
+        if let (Some(bot), Some(chat)) = (&self.bot, session.strip_prefix("tg-").and_then(|c| c.parse::<i64>().ok())) {
+            if let Err(e) = bot.send_long(chat, text).await {
+                tracing::warn!("telegram ping failed: {e:#}");
+            }
+            return;
+        }
+        if let Some(n) = &self.notifier {
+            let notice = Notice { title: "wang".into(), message: text.chars().take(1500).collect(), priority: 3, tags: vec!["bell".into()], approval_id: None };
+            if let Err(e) = n.send(&notice).await {
+                tracing::warn!("alert ping failed: {e:#}");
+            }
+        }
+    }
+
     async fn send(&self, s: &Schedule, text: &str) {
         let short: String = s.task.chars().take(80).collect();
         if let (Some(bot), Some(chat)) = (&self.bot, s.session.strip_prefix("tg-").and_then(|c| c.parse::<i64>().ok())) {

@@ -11,6 +11,8 @@ struct FakeTg {
     calls: Arc<StdMutex<Vec<(String, Value)>>>,
     updates: Arc<StdMutex<VecDeque<Value>>>,
     next_msg: Arc<StdMutex<i64>>,
+    /// Every getUpdates body, in order.
+    polls: Arc<StdMutex<Vec<Value>>>,
 }
 
 impl FakeTg {
@@ -62,6 +64,11 @@ impl FakeTg {
 
     async fn handle(&self, method: &str, body: &Value) -> Value {
         if method == "getUpdates" {
+            self.polls.lock().unwrap().push(body.clone());
+            if body["offset"] == -1 {
+                // "Skip what's queued": the real API returns the last update only.
+                return json!(self.updates.lock().unwrap().drain(..).next_back().into_iter().collect::<Vec<_>>());
+            }
             let batch: Vec<Value> = self.updates.lock().unwrap().drain(..).collect();
             if batch.is_empty() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -99,7 +106,8 @@ impl FakeTg {
     }
 
     async fn wait_for(&self, what: &str, f: impl Fn(&FakeTg) -> bool) {
-        for _ in 0..300 {
+        // Generous: the whole suite runs in parallel (VMs, jails), so a busy machine is normal.
+        for _ in 0..1000 {
             if f(self) {
                 return;
             }
@@ -257,4 +265,52 @@ async fn long_streamed_reply_rolls_over_into_new_messages() {
     assert!(last.ends_with("— footer") && !last.contains("⚙"), "{last}");
     let total: usize = [&texts[0], last].iter().map(|t| t.matches("line").count()).sum();
     assert_eq!(total, 900, "no text lost or duplicated across the rollover");
+}
+
+fn msg_named(update_id: i64, from: i64, username: &str, chat_type: &str, text: &str) -> Value {
+    json!({"update_id": update_id, "message": {"message_id": update_id, "from": {"id": from, "username": username, "is_bot": false},
+           "chat": {"id": from, "type": chat_type}, "text": text}})
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pairing_takes_the_first_private_message_with_the_code() {
+    let tg = FakeTg::default();
+    let base = tg.start().await;
+    let bot = Bot::new(&base, "TEST:token").unwrap();
+    // Queued before the code was shown: skipped, even though it has the code.
+    tg.push(msg_named(7, 666, "early", "private", "/start ABCDE23456"));
+    let feeder = async {
+        tg.wait_for("the skip-old poll", |t| t.polls.lock().unwrap().len() >= 2).await;
+        tg.push(msg_named(8, 99, "stranger", "private", "hey"));
+        tg.push(msg_named(9, 55, "grp", "group", "/start ABCDE23456"));
+        tg.push(msg_named(10, 42, "me", "private", "/start ABCDE23456"));
+    };
+    let mut events = vec![];
+    let (r, ()) = tokio::join!(pair::pair(&bot, "ABCDE23456", Duration::from_secs(5), |e| events.push(e)), feeder);
+    assert_eq!(r.unwrap(), Some(pair::Paired { user_id: 42, name: "@me".into() }));
+    assert_eq!(events, vec![pair::Event::Wrong { user_id: 99, name: "@stranger".into() }, pair::Event::NotPrivate]);
+    let polls = tg.polls.lock().unwrap().clone();
+    assert_eq!(polls[0]["offset"], -1);
+    assert_eq!(polls[1]["offset"], 8, "starts after the queued update");
+    assert_eq!(polls.last().unwrap()["offset"], 11, "the pairing message is acknowledged, so the daemon won't answer it");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pairing_gives_up_on_guessing_and_times_out_quietly() {
+    let tg = FakeTg::default();
+    let base = tg.start().await;
+    let bot = Bot::new(&base, "TEST:token").unwrap();
+    assert_eq!(pair::pair(&bot, "ABCDE23456", Duration::from_millis(300), |_| {}).await.unwrap(), None);
+
+    let before = tg.polls.lock().unwrap().len();
+    let feeder = async {
+        tg.wait_for("the skip-old poll", |t| t.polls.lock().unwrap().len() >= before + 2).await;
+        for i in 0..pair::MAX_WRONG as i64 {
+            tg.push(msg_named(100 + i, 99, "guesser", "private", &format!("/start AAAAA{i:05}")));
+        }
+        // Too late: pairing already stopped.
+        tg.push(msg_named(500, 42, "me", "private", "/start ABCDE23456"));
+    };
+    let (r, ()) = tokio::join!(pair::pair(&bot, "ABCDE23456", Duration::from_secs(5), |_| {}), feeder);
+    assert!(format!("{:#}", r.unwrap_err()).contains("someone is guessing"));
 }

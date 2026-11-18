@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/wang-tokens", "crates/wang-trace", "crates/wang-jail", "crates/wang-daemon", "crates/wang-evals", "crates/wang-bench", "crates/wang-proxy", "crates/wang-browser", "crates/wang-vm-agent", "crates/wang-vm", "crates/wang-cli", "crates/wang-voice"]
+members = ["crates/wang-tokens", "crates/wang-trace", "crates/wang-jail", "crates/wang-daemon", "crates/wang-evals", "crates/wang-bench", "crates/wang-proxy", "crates/wang-browser", "crates/wang-vm-agent", "crates/wang-vm", "crates/wang-cli", "crates/wang-voice", "crates/wang-desktop"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,7 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["rt", "macros", "process", "time", "io-std", "io-util", "sync", "fs", "net", "signal"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 dirs = "5"

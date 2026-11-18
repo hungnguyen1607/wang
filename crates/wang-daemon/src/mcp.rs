@@ -29,6 +29,16 @@ pub struct McpServer {
     /// is then the only check. Off by default.
     pub allow_privileged: bool,
     pub output_cap: usize,
+    /// `wang mcp --via-daemon`: forward tools to the daemon at this socket (a brain's hands:
+    /// the daemon runs them with its approvals, logins and ledger).
+    pub remote: Option<std::path::PathBuf>,
+}
+
+/// One request to the daemon (a fresh connection each, so tool calls can run in parallel).
+async fn ask_daemon(socket: &std::path::Path, msg: &crate::protocol::ClientMsg) -> Result<crate::protocol::ServerMsg> {
+    let mut c = crate::server::Client::connect(socket).await.map_err(|e| anyhow::anyhow!("can't reach the wang daemon at {}: {e}", socket.display()))?;
+    c.send(msg).await?;
+    c.recv().await
 }
 
 const INSTRUCTIONS: &str = "wang runs tools in a sandbox on this Linux machine. shell and read_file see the user's files \
@@ -38,13 +48,23 @@ and try (run alternatives in parallel copies, keep the best). Prefer vm for inst
 generated code, and experiments. The browser shows pages as compact text where links, buttons and fields are numbered [n].";
 
 impl McpServer {
-    fn tool_list(&self) -> Vec<Value> {
-        let mut out: Vec<Value> = tools::definitions_for(&self.ctx)
+    async fn tool_list(&self) -> Vec<Value> {
+        let defs = match &self.remote {
+            Some(sock) => match ask_daemon(sock, &crate::protocol::ClientMsg::ToolList { session: self.session.clone() }).await {
+                Ok(crate::protocol::ServerMsg::Tools { tools }) => tools,
+                other => {
+                    tracing::warn!("tools/list via daemon failed: {other:?}");
+                    vec![]
+                }
+            },
+            None => tools::definitions_for(&self.ctx),
+        };
+        let mut out: Vec<Value> = defs
             .into_iter()
             .map(|d| {
                 let mut schema = d["input_schema"].clone();
                 let mut desc = d["description"].as_str().unwrap_or("").to_string();
-                if d["name"] == "shell" && !self.allow_privileged {
+                if d["name"] == "shell" && !self.allow_privileged && self.remote.is_none() {
                     if let Some(p) = schema["properties"].as_object_mut() {
                         p.remove("privileged");
                     }
@@ -55,7 +75,7 @@ impl McpServer {
                        "annotations": {"readOnlyHint": read_only, "openWorldHint": matches!(d["name"].as_str(), Some("web_fetch" | "browser" | "vm"))}})
             })
             .collect();
-        if self.ledger.is_some() {
+        if self.ledger.is_some() && self.remote.is_none() {
             out.push(json!({
                 "name": "cost",
                 "description": "wang's cost ledger: tokens, cache hits and $ spent (wang's own agent, and Claude Code / opencode traffic sent through `wang proxy`).",
@@ -66,9 +86,21 @@ impl McpServer {
         out
     }
 
-    async fn call_tool(&self, name: &str, args: &Value) -> (String, bool) {
+    async fn call_tool(&self, name: &str, args: &Value) -> (String, bool, Option<String>) {
+        if let Some(sock) = &self.remote {
+            let msg = crate::protocol::ClientMsg::ToolCall { session: self.session.clone(), name: name.to_string(), input: args.clone() };
+            return match ask_daemon(sock, &msg).await {
+                Ok(crate::protocol::ServerMsg::ToolResult { text, is_error, image }) => (text, is_error, image),
+                Ok(other) => (format!("unexpected reply from the wang daemon: {other:?}"), true, None),
+                Err(e) => (format!("{e:#}"), true, None),
+            };
+        }
+        self.call_local(name, args).await
+    }
+
+    async fn call_local(&self, name: &str, args: &Value) -> (String, bool, Option<String>) {
         if name == "cost" {
-            let Some(l) = &self.ledger else { return ("no ledger".into(), true) };
+            let Some(l) = &self.ledger else { return ("no ledger".into(), true, None) };
             let (days, label) = match args["period"].as_str() {
                 Some("week") => (7, "last 7 days"),
                 Some("month") => (30, "last 30 days"),
@@ -76,17 +108,17 @@ impl McpServer {
             };
             let mut text = match l.summary(days, label) {
                 Ok(s) => s.to_string(),
-                Err(e) => return (format!("{e:#}"), true),
+                Err(e) => return (format!("{e:#}"), true, None),
             };
             if let Ok(p) = l.proxy_summary(days, label)
                 && !p.clients.is_empty()
             {
                 text += &format!("\n{p}");
             }
-            return (text, false);
+            return (text, false, None);
         }
         if !tools::definitions_for(&self.ctx).iter().any(|d| d["name"] == name) {
-            return (format!("unknown tool: {name}"), true);
+            return (format!("unknown tool: {name}"), true, None);
         }
         if !self.allow_privileged
             && let Some(why) = self.ctx.approval_reason(name, args, &self.session).await
@@ -101,10 +133,10 @@ impl McpServer {
                  or ask the user to set [mcp] allow_privileged = true in ~/.config/wang/config.toml."
                     .into()
             };
-            return (msg, true);
+            return (msg, true, None);
         }
         let out = tools::run_in(name, args, &self.ctx, &self.session).await;
-        (cap_middle(&out.text, self.output_cap).text, out.is_error)
+        (cap_middle(&out.text, self.output_cap).text, out.is_error, out.image)
     }
 
     fn prompts(&self) -> Vec<Value> {
@@ -142,13 +174,17 @@ impl McpServer {
                 }))
             }
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": self.tool_list()})),
+            "tools/list" => Ok(json!({"tools": self.tool_list().await})),
             "tools/call" => match params["name"].as_str() {
                 Some(name) => {
                     let args = if params["arguments"].is_object() { params["arguments"].clone() } else { json!({}) };
-                    let (text, is_error) = self.call_tool(name, &args).await;
+                    let (text, is_error, image) = self.call_tool(name, &args).await;
                     tracing::info!(tool = name, error = is_error, bytes = text.len(), "mcp tool call");
-                    Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
+                    let mut content = vec![json!({"type": "text", "text": text})];
+                    if let Some(img) = image {
+                        content.push(json!({"type": "image", "data": img, "mimeType": "image/jpeg"}));
+                    }
+                    Ok(json!({"content": content, "isError": is_error}))
                 }
                 None => Err((-32602, "tools/call needs 'name'".into())),
             },
@@ -219,7 +255,7 @@ mod tests {
 
     fn server() -> McpServer {
         let ctx = ToolCtx::with(std::env::temp_dir(), Sandbox::Off, WebPolicy::default());
-        McpServer { ctx, ledger: Some(Arc::new(Ledger::in_memory().unwrap())), session: "mcp-test".into(), allow_privileged: false, output_cap: 40_000 }
+        McpServer { ctx, ledger: Some(Arc::new(Ledger::in_memory().unwrap())), session: "mcp-test".into(), allow_privileged: false, output_cap: 40_000, remote: None }
     }
 
     async fn rpc(s: &McpServer, method: &str, params: Value) -> Value {

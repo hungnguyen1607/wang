@@ -15,7 +15,9 @@ pub struct Config {
     pub memory: MemoryCfg,
     pub routing: RoutingCfg,
     pub telegram: TelegramCfg,
+    pub proactive: ProactiveConfig,
     pub browser: BrowserConfig,
+    pub desktop: DesktopConfig,
     pub vm: VmConfig,
     pub local: LocalConfig,
     pub mcp: McpConfig,
@@ -186,6 +188,48 @@ impl VmConfig {
 
     pub fn root(&self) -> PathBuf {
         if self.dir.trim().is_empty() { wang_vm::Assets::default_root() } else { expand_tilde(self.dir.trim()) }
+    }
+}
+
+/// `[proactive]`: wang checks in on its own (mail, calendar, watched pages).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProactiveConfig {
+    pub enabled: bool,
+    /// No pings in this window (laptop's local time), except meeting reminders.
+    pub quiet_hours: String,
+    pub max_pings_per_day: u32,
+    /// Calendar reminders this long before an event starts.
+    pub remind_before: String,
+}
+
+impl Default for ProactiveConfig {
+    fn default() -> Self {
+        Self { enabled: true, quiet_hours: "23:00-08:00".into(), max_pings_per_day: 8, remind_before: "15m".into() }
+    }
+}
+
+impl ProactiveConfig {
+    pub fn to_cfg(&self) -> Result<crate::watch::ProactiveCfg> {
+        Ok(crate::watch::ProactiveCfg {
+            enabled: self.enabled,
+            quiet_hours: self.quiet_hours.clone(),
+            max_pings_per_day: self.max_pings_per_day.max(1),
+            remind_before: wang_jail::policy::parse_duration(&self.remind_before)?,
+        })
+    }
+}
+
+/// `[desktop]`: open apps and use their windows (GNOME, through accessibility).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DesktopConfig {
+    pub enabled: bool,
+}
+
+impl Default for DesktopConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -453,6 +497,12 @@ pub struct ModelCfg {
     pub base_url: Option<String>,
     /// Send prompt-caching hints (cache_control). Off only for the eval baseline ("plain" arm).
     pub cache_hints: bool,
+    /// deepseek / openai: which .env variable holds the key (default DEEPSEEK_API_KEY / OPENAI_API_KEY).
+    pub api_key_env: Option<String>,
+    /// claude-code / codex: API provider for what the CLI can't do (history summaries), and the
+    /// brain to fall back to. Empty = none.
+    pub fallback: Option<String>,
+    pub fallback_model: Option<String>,
 }
 
 impl Default for ModelCfg {
@@ -466,6 +516,9 @@ impl Default for ModelCfg {
             fallbacks: true,
             base_url: None,
             cache_hints: true,
+            api_key_env: None,
+            fallback: None,
+            fallback_model: None,
         }
     }
 }
@@ -474,6 +527,8 @@ impl ModelCfg {
     pub fn model_id(&self) -> String {
         self.model.clone().unwrap_or_else(|| match self.provider.as_str() {
             "anthropic" => "claude-opus-5-5".into(),
+            "deepseek" => "deepseek-chat".into(),
+            "openai" => "gpt-5-mini".into(),
             _ => "anthropic/claude-haiku-5.5".into(),
         })
     }
@@ -532,7 +587,8 @@ name = "wang"                            # what it calls itself (also the voice 
 # spoken_style = ""                      # how read-aloud replies sound (empty = short plain sentences)
 
 [model]
-provider = "openrouter"                  # openrouter | anthropic
+provider = "openrouter"                  # openrouter | anthropic | deepseek | openai, or your own subscription:
+                                         # claude-code (Claude Pro/Max via Claude Code) | codex (ChatGPT via Codex CLI)
 model = "anthropic/claude-haiku-5.5"     # cheap default; strong option: "anthropic/claude-opus-5.5"
 max_tokens = 16000
 # reasoning_effort = "low"               # openrouter: none | minimal | low | medium | high | xhigh | max
@@ -582,6 +638,9 @@ memory = "1G"                            # RAM cap per browser
 max_browsers = 2                         # at once (one per conversation); idle ones close after idle_timeout
 idle_timeout = "5m"
 
+[desktop]                                # open apps and use their windows (read, click, type); screenshots + keys after `wang setup screen`
+enabled = true                           # chat/mail/browser/settings apps: acting as you asks first, like signed-in sites
+
 [vm]                                     # Firecracker micro-VMs; run `wang vm setup` once
 enabled = true
 vcpus = 2
@@ -608,6 +667,12 @@ allowed_user_ids = []                    # your numeric id; message the bot once
 stream = true                            # edit the reply live as it's written
 alerts = true                            # alerts + Approve/Deny buttons for every session go to Telegram too
 
+[proactive]                              # wang checks in by itself: "ping me about important email", "remind me before meetings"
+enabled = true                           # (only watches you ask for; they read through the signed-in browser, never act)
+quiet_hours = "23:00-08:00"              # no pings then (meeting reminders still come); /quiet 2h on Telegram pauses them
+max_pings_per_day = 8
+remind_before = "15m"                    # calendar reminders this long before each event
+
 [ntfy]
 server = "https://ntfy.sh"
 topic = ""                               # empty = alerts off; use a long random name on ntfy.sh
@@ -618,6 +683,36 @@ pub const EXAMPLE_ENV: &str = "# wang secrets — keep this file chmod 600\nOPEN
 
 fn config_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("wang")
+}
+
+/// Set `[model] provider` in the config file, keeping its comments. The model is cleared
+/// when switching between API and subscription brains (their model names differ).
+pub fn set_provider(path: &Path, provider: &str) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().context("config.toml isn't valid TOML")?;
+    if !doc.contains_key("model") {
+        doc["model"] = toml_edit::table();
+    }
+    let old = doc["model"]["provider"].as_str().unwrap_or("openrouter").to_string();
+    match doc["model"]["provider"].as_value_mut() {
+        // Keep the line's comment.
+        Some(v) => {
+            let decor = v.decor().clone();
+            *v = provider.into();
+            *v.decor_mut() = decor;
+        }
+        None => doc["model"]["provider"] = toml_edit::value(provider),
+    }
+    let cli = |p: &str| crate::brain::Kind::from_provider(p).is_some();
+    if cli(&old) != cli(provider)
+        && let Some(t) = doc["model"].as_table_like_mut()
+    {
+        t.remove("model");
+    }
+    let tmp = path.with_extension("toml.wang-tmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 pub fn config_path() -> PathBuf {
@@ -684,8 +779,9 @@ impl Config {
         } else {
             Config::default()
         };
-        if !matches!(cfg.model.provider.as_str(), "openrouter" | "anthropic") {
-            bail!("unknown provider '{}' (expected openrouter or anthropic)", cfg.model.provider);
+        let p = cfg.model.provider.as_str();
+        if !matches!(p, "openrouter" | "anthropic" | "deepseek" | "openai") && crate::brain::Kind::from_provider(p).is_none() {
+            bail!("unknown provider '{p}' (expected openrouter, anthropic, deepseek, openai, claude-code or codex)");
         }
         Ok(cfg)
     }

@@ -113,6 +113,13 @@ impl Pool {
         }
     }
 
+    /// Host of the page the session's browser is on.
+    pub async fn page_host(&self, session: &str) -> Option<String> {
+        let lease = self.slots.lock().await.get(session).map(|s| s.browser.clone())?;
+        let url = lease.lock().await.url().await.ok()?;
+        url.split_once("://").map(|(_, r)| r.split(['/', '?', '#']).next().unwrap_or(r).to_string())
+    }
+
     /// Close one session's browser (e.g. on `/new`).
     pub async fn release(&self, session: &str) {
         if let Some(s) = self.slots.lock().await.remove(session) {

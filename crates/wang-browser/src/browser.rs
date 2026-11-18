@@ -16,6 +16,36 @@ use crate::{BrowserCfg, find_chrome};
 
 const VIEW_JS: &str = include_str!("view.js");
 
+/// Where the jailed browser sees files the user chose to upload.
+const UPLOADS_IN_JAIL: &str = "/run/wang-uploads";
+/// Largest file wang will upload.
+pub const MAX_UPLOAD_BYTES: u64 = 25 << 20;
+
+/// The file input behind element [n]: itself, one inside it, the one its label points to, or
+/// the only one in its form / on the page (sites hide the real input behind a styled button).
+const FILE_INPUT_JS: &str = r#"(n) => {
+  const el = (window.__wangRefs || [])[n - 1];
+  if (!el || !el.isConnected) return null;
+  const isFile = (x) => x && x.tagName === "INPUT" && (x.type || "").toLowerCase() === "file";
+  if (isFile(el)) return el;
+  const inside = el.querySelector && el.querySelector("input[type=file]");
+  if (inside) return inside;
+  if (el.htmlFor) { const t = document.getElementById(el.htmlFor); if (isFile(t)) return t; }
+  const lab = el.closest("label");
+  if (lab) { const t = lab.control || lab.querySelector("input[type=file]"); if (isFile(t)) return t; }
+  const scope = el.closest("form") || document;
+  const all = scope.querySelectorAll("input[type=file]");
+  if (all.length === 1) return all[0];
+  const page = document.querySelectorAll("input[type=file]");
+  return page.length === 1 ? page[0] : null;
+}"#;
+
+static UPLOAD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn upload_root() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("wang/uploads")
+}
+
 /// Scroll a ref into view and return its center, or null if it's gone.
 const BOX_JS: &str = r#"(n) => {
   const el = (window.__wangRefs || [])[n - 1];
@@ -121,6 +151,8 @@ pub struct Browser {
     /// The login file's modification time at launch: if it changed since (a `wang login`),
     /// this browser's older cookies aren't saved over it.
     jar_mtime: Option<std::time::SystemTime>,
+    /// Host folder visible (read-only) in the jail as /run/wang-uploads.
+    upload_dir: PathBuf,
 }
 
 impl Browser {
@@ -136,8 +168,11 @@ impl Browser {
         if !dir.starts_with("/usr") {
             read.push(dir);
         }
+        let upload_dir = upload_root().join(format!("{}-{}", std::process::id(), UPLOAD_SEQ.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&upload_dir)?;
         let policy = Policy {
             read,
+            binds: vec![wang_jail::Bind { src: upload_dir.clone(), dst: PathBuf::from(UPLOADS_IN_JAIL), writable: false }],
             domains: cfg.domains.clone(),
             limits: Limits {
                 memory_bytes: cfg.memory_bytes,
@@ -175,6 +210,7 @@ impl Browser {
             signed_in: vec![],
             logins_error: None,
             jar_mtime: None,
+            upload_dir,
         };
         b.cdp.call(None, "Browser.setDownloadBehavior", json!({"behavior": "deny"})).await.ok();
         if let Some(l) = &cfg.logins {
@@ -484,22 +520,36 @@ impl Browser {
     /// Guardrail: if this action would act as the user on a signed-in site, why (for the
     /// approval prompt). `n` is the element number, `open_url` the target of an `open`.
     pub async fn guard(&self, action: &str, n: Option<usize>, submit: bool, open_url: Option<&str>) -> Option<String> {
-        if self.signed_in.is_empty() {
+        if !matches!(action, "click" | "type" | "select" | "open") {
             return None;
         }
         let page = match open_url {
             Some(u) => u.to_string(),
             None => self.url().await.unwrap_or_default(),
         };
-        let host = host_port(&page).map(|h| h.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or(h))?;
-        if !self.signed_in_at(&host) {
-            return None;
-        }
-        let info = match n {
+        let host = host_port(&page).map(|h| h.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or(h)).unwrap_or_else(|| "this page".into());
+        let info: Option<crate::guard::RefInfo> = match n {
             Some(n) => self.eval(&format!("({})({n})", crate::guard::REF_INFO_JS)).await.ok().and_then(|v| serde_json::from_value(v).ok()),
             None => None,
         };
-        crate::guard::assess(action, info.as_ref(), submit, open_url).map(|why| format!("{why} on {host}, where wang is signed in as you"))
+        let signed = self.signed_in_at(&host);
+        let where_ = if signed { format!("on {host}, where wang is signed in as you") } else { format!("on {host}") };
+        // Any site: submitting, registering, agreeing, paying, sending.
+        let commit = match action {
+            "click" => crate::guard::commit_reason(action, info.as_ref()),
+            "type" => crate::guard::commit_enter(info.as_ref(), submit),
+            _ => None,
+        };
+        let why = commit.or_else(|| if signed { crate::guard::assess(action, info.as_ref(), submit, open_url) } else { None })?;
+        // Show what's being sent.
+        let form = match n {
+            Some(n) if action != "open" => self.eval(&format!("({})({n})", crate::guard::FORM_JS)).await.ok().and_then(|v| v.as_str().map(String::from)).filter(|s| !s.is_empty()),
+            _ => None,
+        };
+        Some(match form {
+            Some(f) => format!("{why} {where_}\nForm: {f}"),
+            None => format!("{why} {where_}"),
+        })
     }
 
     pub async fn url(&self) -> Result<String> {
@@ -510,7 +560,58 @@ impl Browser {
     pub async fn close(self) -> Stopped {
         self.save_logins().await;
         let _ = self.cdp.call_timeout(None, "Browser.close", json!({}), Duration::from_secs(2)).await;
-        self.running.stop().await
+        let stopped = self.running.stop().await;
+        let _ = std::fs::remove_dir_all(&self.upload_dir);
+        stopped
+    }
+
+    /// Attach `file` (a path on the host the caller already checked) to the file input at or
+    /// behind element [n]. Returns what the page now holds.
+    pub async fn upload(&mut self, n: usize, file: &std::path::Path) -> Result<String> {
+        self.ready().await?;
+        let meta = std::fs::metadata(file).with_context(|| format!("{}", file.display()))?;
+        if !meta.is_file() {
+            bail!("{} isn't a file", file.display());
+        }
+        if meta.len() > MAX_UPLOAD_BYTES {
+            bail!("{} is {} MB; the limit is {} MB", file.display(), meta.len() >> 20, MAX_UPLOAD_BYTES >> 20);
+        }
+        let name: String = file
+            .file_name()
+            .map(|n| n.to_string_lossy().chars().map(|c| if c == '/' || c.is_control() { '_' } else { c }).collect())
+            .unwrap_or_else(|| "upload".into());
+        let staged = self.upload_dir.join(&name);
+        let _ = std::fs::remove_file(&staged);
+        if std::fs::hard_link(file, &staged).is_err() {
+            std::fs::copy(file, &staged).with_context(|| format!("copying {} for upload", file.display()))?;
+        }
+        // The input as a remote object (not by value), so CDP can set its files.
+        let r = self
+            .cdp
+            .call(self.sid(), "Runtime.evaluate", json!({"expression": format!("({FILE_INPUT_JS})({n})"), "returnByValue": false}))
+            .await?;
+        let Some(obj) = r["result"]["objectId"].as_str() else {
+            bail!("no file upload field at or behind [{n}]; view the page and pick the upload button or the file field");
+        };
+        self.cdp
+            .call(self.sid(), "DOM.setFileInputFiles", json!({"files": [format!("{UPLOADS_IN_JAIL}/{name}")], "objectId": obj}))
+            .await
+            .context("attaching the file")?;
+        // Sites react to the change event (preview, validation).
+        let check = self
+            .cdp
+            .call(
+                self.sid(),
+                "Runtime.callFunctionOn",
+                json!({"objectId": obj, "returnByValue": true,
+                       "functionDeclaration": "function() { this.dispatchEvent(new Event('change', {bubbles: true})); const f = this.files && this.files[0]; return f ? f.name + ' (' + f.size + ' bytes)' : ''; }"}),
+            )
+            .await?;
+        let held = check["result"]["value"].as_str().unwrap_or("").to_string();
+        if held.is_empty() {
+            bail!("the page didn't take the file");
+        }
+        Ok(held)
     }
 }
 

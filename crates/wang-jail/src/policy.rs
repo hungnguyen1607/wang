@@ -25,6 +25,12 @@ pub const ALWAYS_HIDDEN: &[&str] = &[
     "~/.cargo/credentials",
     "~/.cargo/credentials.toml",
     "~/.config/gh",
+    // AI subscription logins (a brain CLI gets only its own, in its own jail).
+    "~/.claude/.credentials.json",
+    "~/.claude.json",
+    "~/.codex/auth.json",
+    "~/.gemini/oauth_creds.json",
+    "~/.config/openai",
     "~/.config/wang",
     "~/.local/share/wang",
     "~/.local/share/keyrings",

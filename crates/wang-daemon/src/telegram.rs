@@ -22,6 +22,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
+pub mod pair;
+
 use crate::config::TelegramCfg;
 use crate::model::ModelClient;
 use crate::notify::{Notice, Notify};
@@ -91,6 +93,18 @@ impl Bot {
             Err(e) if e.to_string().contains("message is not modified") => Ok(()),
             r => r.map(|_| ()),
         }
+    }
+
+    /// A JPEG (e.g. a screenshot) with a caption.
+    pub async fn send_photo(&self, chat: i64, jpeg: Vec<u8>, caption: &str) -> Result<()> {
+        let part = reqwest::multipart::Part::bytes(jpeg).file_name("screen.jpg").mime_str("image/jpeg")?;
+        let form = reqwest::multipart::Form::new().text("chat_id", chat.to_string()).text("caption", caption.chars().take(1000).collect::<String>()).part("photo", part);
+        let resp = self.http.post(format!("{}/sendPhoto", self.base)).multipart(form).send().await.map_err(|e| anyhow!("telegram sendPhoto: {}", e.without_url()))?;
+        let v: Value = resp.json().await.map_err(|e| anyhow!("telegram sendPhoto: bad response: {}", e.without_url()))?;
+        if v["ok"] != true {
+            bail!("telegram sendPhoto: {}", v["description"].as_str().unwrap_or("unknown error"));
+        }
+        Ok(())
     }
 
     pub async fn send_long(&self, chat: i64, text: &str) -> Result<()> {
@@ -204,6 +218,10 @@ impl TelegramChannel {
 
 const HELP: &str = "wang is online. Just write what you need.\n\n\
 /new – start a fresh conversation\n\
+/screen – a screenshot of the laptop\n\
+/watches, /unwatch <n> – what wang checks on by itself; /quiet [2h|off] – pause pings\n\
+/brief – your day now (calendar, important mail)\n\
+/brain [claude|codex|api] – what does the thinking (your subscription or an API key)\n\
 /cost [today|week|month] – tokens and $\n\
 /stats – agent health (last 7 days)\n\
 /trace [id] – step-by-step timeline of the last task\n\
@@ -302,6 +320,55 @@ impl TelegramChannel {
         let last = self.last_task.lock().unwrap().get(&chat).copied();
         match cmd.as_deref() {
             Some("start" | "help") => self.reply(chat, HELP).await,
+            Some("watches") => {
+                let msg = match &a.ctx.watches {
+                    Some(s) => s.list(Some(&session)).map(|l| crate::watch::render(&l)).unwrap_or_else(|e| format!("error: {e:#}")),
+                    None => "Watches are off ([proactive] in config.toml).".into(),
+                };
+                self.reply(chat, &msg).await;
+            }
+            Some("unwatch") => {
+                let msg = match (&a.ctx.watches, arg.trim_start_matches('#').parse::<i64>()) {
+                    (Some(s), Ok(id)) => match s.remove(id, Some(&session)) {
+                        Ok(true) => format!("Watch #{id} removed."),
+                        Ok(false) => format!("No watch #{id} here."),
+                        Err(e) => format!("error: {e:#}"),
+                    },
+                    _ => "Usage: /unwatch <n> (see /watches)".into(),
+                };
+                self.reply(chat, &msg).await;
+            }
+            Some("quiet") => {
+                let msg = match &a.ctx.watches {
+                    Some(s) if arg == "off" => s.set_quiet_until(None).map(|_| "Pings are back on.".to_string()).unwrap_or_else(|e| format!("error: {e:#}")),
+                    Some(s) => {
+                        let d = wang_jail::policy::parse_duration(if arg.is_empty() { "1h" } else { arg }).unwrap_or(Duration::from_secs(3600));
+                        let until = chrono::Local::now() + chrono::Duration::seconds(d.as_secs() as i64);
+                        s.set_quiet_until(Some(until)).map(|_| format!("No pings until {} (meeting reminders still come). /quiet off to undo.", until.format("%H:%M"))).unwrap_or_else(|e| format!("error: {e:#}"))
+                    }
+                    None => "Watches are off.".into(),
+                };
+                self.reply(chat, &msg).await;
+            }
+            Some("screen") => match &a.ctx.desktop {
+                Some(d) => match d.screenshot(1600).await {
+                    Ok(shot) => {
+                        if let Err(e) = self.bot.send_photo(chat, shot.jpeg, "The laptop's screen right now.").await {
+                            self.reply(chat, &format!("Couldn't send the screenshot: {e:#}")).await;
+                        }
+                    }
+                    Err(e) => self.reply(chat, &format!("No screenshot: {e:#}")).await,
+                },
+                None => self.reply(chat, "Desktop control is off on the laptop ([desktop] in config.toml).").await,
+            },
+            Some("brain") => {
+                let msg = if arg.is_empty() {
+                    a.brain_status()
+                } else {
+                    a.switch_brain(&arg.to_ascii_lowercase()).unwrap_or_else(|e| format!("Couldn't switch: {e:#}"))
+                };
+                self.reply(chat, &msg).await;
+            }
             Some("new") => {
                 hub.reset(&session).await;
                 self.reply(chat, "Started a new conversation.").await;
@@ -370,13 +437,14 @@ impl TelegramChannel {
                 };
                 self.reply(chat, &s).await;
             }
-            Some(other) if crate::workflow::Workflow::from_name(other).is_none() => {
+            Some(other) if other != "brief" && crate::workflow::Workflow::from_name(other).is_none() => {
                 self.reply(chat, &format!("Unknown command /{other}.\n\n{HELP}")).await
             }
             // /research /code /quick /general: a message with that workflow (the agent reads the prefix).
-            Some(w) if arg.is_empty() => self.reply(chat, &format!("Usage: /{w} <what you want done>")).await,
+            Some(w) if arg.is_empty() && w != "brief" => self.reply(chat, &format!("Usage: /{w} <what you want done>")).await,
             Some(_) | None => {
                 let text = match cmd.as_deref() {
+                    Some("brief") => format!("Load the morning-brief skill and give me my brief now. {arg}").trim().to_string(),
                     Some(w) => format!("/{w} {arg}"),
                     None => text.to_string(),
                 };

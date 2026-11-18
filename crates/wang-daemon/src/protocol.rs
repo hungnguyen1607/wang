@@ -18,6 +18,10 @@ pub enum ClientMsg {
     New { session: String },
     /// Answer a pending approval request.
     Approve { id: String, allow: bool },
+    /// From a brain's MCP proxy (`wang mcp --via-daemon`): wang's tool definitions.
+    ToolList { session: String },
+    /// From a brain's MCP proxy: run one tool in `session` (approvals, sandbox, ledger apply).
+    ToolCall { session: String, name: String, input: serde_json::Value },
 }
 
 /// Daemon → client. A `Message` produces a stream of events ending in `Done` or `Error`.
@@ -33,6 +37,16 @@ pub enum ServerMsg {
     /// approved | denied | timed_out
     ApprovalResult { id: String, decision: String },
     Done { task_id: i64, footer: String },
+    /// Reply to `ToolList`: tool definitions (name, description, input_schema).
+    Tools { tools: Vec<serde_json::Value> },
+    /// Reply to `ToolCall`.
+    ToolResult {
+        text: String,
+        is_error: bool,
+        /// base64 JPEG (screenshots).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
+    },
     Error { message: String },
     Ok,
 }

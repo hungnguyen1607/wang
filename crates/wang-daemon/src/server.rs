@@ -143,6 +143,15 @@ async fn handle_conn<C: ModelClient>(stream: UnixStream, hub: Arc<Hub<C>>) -> Re
                 let reply = if ok { ServerMsg::Ok } else { ServerMsg::Error { message: format!("no pending approval {id}") } };
                 send(&mut w, &reply).await?;
             }
+            ClientMsg::ToolList { session: _ } => {
+                send(&mut w, &ServerMsg::Tools { tools: hub.agent.brain_tools() }).await?;
+            }
+            ClientMsg::ToolCall { session, name, input } => {
+                // Its own task: the turn that asked holds the conversation lock meanwhile.
+                let hub = hub.clone();
+                let (text, is_error, image) = hub.agent.brain_tool_call(&session, &name, input).await;
+                send(&mut w, &ServerMsg::ToolResult { text, is_error, image }).await?;
+            }
             ClientMsg::Message { session, text, voice } => {
                 let conv = hub.session(&session).await;
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerMsg>();
