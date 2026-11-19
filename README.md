@@ -1,4 +1,7 @@
 # wang
+I have been requested to publish the project so everyone can try 
+
+
 
 A personal AI agent for your laptop. Runs commands, drives a browser, uses throwaway VMs — safely, and tracks every token.
 
